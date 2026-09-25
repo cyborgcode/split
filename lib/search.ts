@@ -10,30 +10,7 @@ const SEARCH_TIMEOUT_MS = 4000;
 const PREFERRED_DOMAINS =
   /\.(gov|edu|int)([/:]|$)|who\.int|un\.org|oecd\.org|worldbank\.org|imf\.org|europa\.eu|nature\.com|science\.org|britannica\.com|reuters\.com|apnews\.com|pewresearch\.org|ourworldindata\.org|wikipedia\.org/i;
 
-async function searchTavily(query: string): Promise<SearchResult[]> {
-  const res = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      api_key: process.env.TAVILY_API_KEY,
-      query,
-      max_results: 5,
-      search_depth: "basic",
-    }),
-    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
-  });
-  if (!res.ok) throw new Error(`Tavily error ${res.status}`);
-  const data = await res.json();
-  return (data?.results ?? [])
-    .filter((r: { url?: string }) => typeof r?.url === "string")
-    .map((r: { title?: string; url: string; content?: string }) => ({
-      title: r.title ?? r.url,
-      url: r.url,
-      snippet: r.content ?? "",
-    }));
-}
-
-/* Keyless fallback so search works with zero configuration. */
+/* Keyless — sources work with zero configuration and no extra API. */
 async function searchWikipedia(query: string): Promise<SearchResult[]> {
   const res = await fetch(
     `https://en.wikipedia.org/w/rest.php/v1/search/page?limit=3&q=${encodeURIComponent(query)}`,
@@ -54,24 +31,16 @@ async function searchWikipedia(query: string): Promise<SearchResult[]> {
 }
 
 /**
- * Search the web with whichever provider is configured, in order of quality:
- * Tavily → Wikipedia (keyless). Returns null if everything fails — callers
+ * Look up a citable page for a correction. Returns null on failure — callers
  * should fall back gracefully rather than block the debate.
  */
 export async function searchWeb(query: string): Promise<SearchResult[] | null> {
-  const providers: Array<() => Promise<SearchResult[]>> = [];
-  if (process.env.TAVILY_API_KEY) providers.push(() => searchTavily(query));
-  providers.push(() => searchWikipedia(query));
-
-  for (const provider of providers) {
-    try {
-      const results = await provider();
-      if (results.length > 0) return results;
-    } catch {
-      /* try the next provider */
-    }
+  try {
+    const results = await searchWikipedia(query);
+    return results.length > 0 ? results : null;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 /** Pick the most citable result, preferring authoritative domains. */

@@ -89,28 +89,41 @@ const GEMINI_RESPONSE_SCHEMA = {
   required: ["claims", "fallacies"],
 };
 
-/* Tried in order; a 404 (model renamed/retired) falls through to the next. */
-const GEMINI_MODELS = [
-  "gemini-3.1-flash-lite",
-  "gemini-2.5-flash-lite",
-  "gemini-2.5-flash",
-  "gemini-2.0-flash",
-];
+/* Free-tier quotas are counted per model, so falling through on a 429 to
+   the next model roughly doubles how long a debate can run each day.
+   Measured free tier (Sept 2026): both Flash-Lite models get 15 RPM /
+   500 RPD — the most generous of any Gemini text model. 3.5 is the newer,
+   sharper one. The Flash models (5 RPM / 20 RPD) and the 2.x family
+   (shut down or closed to new keys) are deliberately not in the chain. */
+const GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
 
 interface ModelReply {
   text: string;
   model: string;
 }
 
+type GeminiError = Error & { status: number; dailyQuota?: boolean };
+
+function geminiError(message: string, status: number, dailyQuota = false): GeminiError {
+  return Object.assign(new Error(message), { status, dailyQuota });
+}
+
+/** A 429 body names the quota it hit — tells a daily cap from a per-minute one. */
+function isDailyQuota(body: string): boolean {
+  return /PerDay/i.test(body);
+}
+
 async function callGemini(chunk: string, context?: string): Promise<ModelReply> {
   const key = process.env.GEMINI_API_KEY!;
-  const models = process.env.GEMINI_MODEL
-    ? [process.env.GEMINI_MODEL, ...GEMINI_MODELS]
+  const override = process.env.GEMINI_MODEL?.trim();
+  const models = override
+    ? [override, ...GEMINI_MODELS.filter((m) => m !== override)]
     : GEMINI_MODELS;
 
   let lastError = "";
   let lastStatus = 502;
-  const deadline = Date.now() + 18000; // stay well under the platform timeout
+  let allDaily = true; // every model answered 429 with a per-day quota
+  const deadline = Date.now() + 22000; // stay well under the platform timeout
   for (const model of models) {
     const budget = deadline - Date.now();
     if (budget < 2000) break;
@@ -129,75 +142,56 @@ async function callGemini(chunk: string, context?: string): Promise<ModelReply> 
             contents: [
               { role: "user", parts: [{ text: buildUserPrompt(chunk, context) }] },
             ],
+            // Gemini 3 models are tuned for the default temperature (1.0);
+            // forcing it low can make them loop or degrade — the schema
+            // already keeps the output deterministic in shape.
             generationConfig: {
-              temperature: 0.1,
               responseMimeType: "application/json",
               responseSchema: GEMINI_RESPONSE_SCHEMA,
             },
           }),
-          signal: AbortSignal.timeout(Math.min(12000, budget)),
+          signal: AbortSignal.timeout(Math.min(15000, budget)),
         }
       );
     } catch (err) {
       // Slow generation — report as transient so the client retries quietly.
+      allDaily = false;
       lastStatus = 503;
       lastError = `Gemini timed out on ${model}: ${String(err).slice(0, 120)}`;
       continue;
     }
     if (res.ok) {
       const data = await res.json();
-      return {
-        text: data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "",
-        model,
-      };
+      const parts: Array<{ text?: string; thought?: boolean }> =
+        data?.candidates?.[0]?.content?.parts ?? [];
+      // Skip any thought parts; the JSON answer is the non-thought text.
+      const text = parts
+        .filter((p) => !p.thought && typeof p.text === "string")
+        .map((p) => p.text)
+        .join("");
+      if (!text) {
+        // Safety-blocked or empty. Heated debates trip the filters, and the
+        // same slice would be blocked again on every retry — so count it as
+        // checked-with-nothing-to-flag and let the debate move on.
+        console.warn(
+          `Gemini returned no text on ${model} (${
+            data?.candidates?.[0]?.finishReason ?? data?.promptFeedback?.blockReason ?? "unknown"
+          }) — skipping this slice`
+        );
+        return { text: '{"claims": [], "fallacies": []}', model };
+      }
+      return { text, model };
     }
+    const body = await res.text();
     lastStatus = res.status;
-    lastError = `Gemini API error ${res.status} on ${model}: ${await res.text()}`;
-    // Auth errors can't be fixed by another model; anything else (404 gone,
-    // 429 quota — each model has its own, 500/503 hiccups) falls through.
-    if (res.status === 401 || res.status === 403) break;
+    lastError = `Gemini API error ${res.status} on ${model}: ${body}`;
+    if (res.status !== 429 || !isDailyQuota(body)) allDaily = false;
+    // Bad key / request can't be fixed by another model; anything else
+    // (404 retired, 429 quota — each model has its own, 5xx hiccups)
+    // falls through to the next one.
+    if (res.status === 400 || res.status === 401 || res.status === 403) break;
   }
-  throw Object.assign(new Error(lastError), { status: lastStatus });
-}
-
-async function callNvidiaNim(chunk: string, context?: string): Promise<ModelReply> {
-  const key = process.env.NVIDIA_NIM_API_KEY!;
-  const model = process.env.NVIDIA_NIM_MODEL || "deepseek-ai/deepseek-v4-flash";
-  let res: Response;
-  try {
-    res = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${key}`,
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.1,
-        // Reasoning models burn tokens thinking before the JSON answer —
-        // leave generous room so the answer isn't truncated.
-        max_tokens: 4096,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: buildUserPrompt(chunk, context) },
-        ],
-      }),
-      signal: AbortSignal.timeout(20000),
-    });
-  } catch (err) {
-    throw Object.assign(
-      new Error(`NVIDIA NIM timed out: ${String(err).slice(0, 120)}`),
-      { status: 503 }
-    );
-  }
-  if (!res.ok) {
-    throw Object.assign(
-      new Error(`NVIDIA NIM API error ${res.status}: ${await res.text()}`),
-      { status: res.status }
-    );
-  }
-  const data = await res.json();
-  return { text: data?.choices?.[0]?.message?.content ?? "", model };
+  throw geminiError(lastError, lastStatus, lastStatus === 429 && allDaily);
 }
 
 interface ParsedReply {
@@ -274,10 +268,8 @@ function toFindings(parsed: ParsedReply | null): {
   return { findings: findings.slice(0, 8), claimsChecked };
 }
 
-async function runAnalysis(useGemini: boolean, chunk: string, context?: string) {
-  const reply = useGemini
-    ? await callGemini(chunk, context)
-    : await callNvidiaNim(chunk, context);
+async function runAnalysis(chunk: string, context?: string) {
+  const reply = await callGemini(chunk, context);
   const parsed = extractJson(reply.text);
   const { findings, claimsChecked } = toFindings(parsed);
   console.log(
@@ -286,34 +278,35 @@ async function runAnalysis(useGemini: boolean, chunk: string, context?: string) 
   return { findings, claimsChecked, model: reply.model, parsed };
 }
 
-function pickProvider(requested?: string): { useGemini: boolean } | NextResponse {
-  const hasGemini = !!process.env.GEMINI_API_KEY;
-  const hasNim = !!process.env.NVIDIA_NIM_API_KEY;
-  if (!hasGemini && !hasNim) {
+function missingKey(): NextResponse | null {
+  if (process.env.GEMINI_API_KEY) return null;
+  return NextResponse.json(
+    {
+      error:
+        "No Gemini API key configured. Set GEMINI_API_KEY (free at https://aistudio.google.com/apikey) in your environment.",
+    },
+    // 500, not 503: the client treats 503 as a transient hiccup to retry
+    { status: 500 }
+  );
+}
+
+function errorResponse(err: unknown): NextResponse {
+  console.error("analyze failed:", err);
+  const detail = err instanceof Error ? err.message.slice(0, 300) : "";
+  const { status: upstream, dailyQuota } = (err ?? {}) as Partial<GeminiError>;
+  if (dailyQuota) {
     return NextResponse.json(
       {
         error:
-          "No AI provider configured. Set GEMINI_API_KEY (https://aistudio.google.com/apikey) or NVIDIA_NIM_API_KEY (https://build.nvidia.com) in your environment.",
+          "Today's free Gemini quota is used up on every model. It resets at midnight Pacific time.",
+        daily_quota: true,
       },
-      { status: 503 }
+      { status: 429 }
     );
   }
-  if (requested === "nvidia") {
-    if (!hasNim) {
-      return NextResponse.json(
-        { error: "NVIDIA NIM not configured — set NVIDIA_NIM_API_KEY." },
-        { status: 503 }
-      );
-    }
-    return { useGemini: false };
-  }
-  if (requested === "gemini" && !hasGemini) {
-    return NextResponse.json(
-      { error: "Gemini not configured — set GEMINI_API_KEY." },
-      { status: 503 }
-    );
-  }
-  return { useGemini: hasGemini };
+  // Pass rate limits / overload through so the client backs off quietly.
+  const status = upstream === 429 || upstream === 503 ? upstream : 502;
+  return NextResponse.json({ error: `Analysis failed. ${detail}`.trim() }, { status });
 }
 
 export async function POST(req: NextRequest) {
@@ -333,61 +326,47 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Input too long" }, { status: 413 });
   }
 
-  const picked = pickProvider(body.provider);
-  if (picked instanceof NextResponse) return picked;
+  const noKey = missingKey();
+  if (noKey) return noKey;
 
   try {
-    const result = await runAnalysis(picked.useGemini, chunk, context);
+    const result = await runAnalysis(chunk, context);
     return NextResponse.json({
       findings: result.findings,
       claims_checked: result.claimsChecked,
-      provider: picked.useGemini ? "gemini" : "nvidia-nim",
       model: result.model,
     });
   } catch (err) {
-    console.error("analyze failed:", err);
-    const detail = err instanceof Error ? err.message.slice(0, 300) : "";
-    const upstream = (err as { status?: number }).status;
-    // Pass rate limits / overload through so the client backs off quietly.
-    const status = upstream === 429 || upstream === 503 ? upstream : 502;
-    return NextResponse.json(
-      { error: `Analysis failed. ${detail}`.trim() },
-      { status }
-    );
+    return errorResponse(err);
   }
 }
 
 /**
- * Self-test: open /api/analyze in a browser — add ?provider=nvidia to test
- * NIM, or ?q=your+own+claim. Runs the full pipeline with your real keys and
- * reports the model, the raw per-claim verdicts, and PASS/FAIL.
+ * Self-test: open /api/analyze in a browser, or ?q=your+own+claim. Runs the
+ * full pipeline with your real key and reports the model, the raw per-claim
+ * verdicts, and PASS/FAIL.
  */
 export async function GET(req: NextRequest) {
   const q = req.nextUrl.searchParams.get("q");
   const chunk = q?.trim() || "The sun revolves around the Earth, everyone knows that.";
-  const requested = req.nextUrl.searchParams.get("provider") ?? undefined;
 
-  const picked = pickProvider(requested);
-  if (picked instanceof NextResponse) return picked;
+  const noKey = missingKey();
+  if (noKey) return noKey;
 
   try {
-    const result = await runAnalysis(picked.useGemini, chunk);
+    const result = await runAnalysis(chunk);
     return NextResponse.json({
       verdict:
         result.findings.length > 0
           ? "PASS — the claim was flagged"
           : "FAIL — nothing flagged (share this JSON when reporting)",
       test_input: chunk,
-      provider: picked.useGemini ? "gemini" : "nvidia-nim",
       model: result.model,
       claims_checked: result.claimsChecked,
       findings: result.findings,
       raw_claims: (result.parsed as ParsedReply | null)?.claims ?? null,
     });
   } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message.slice(0, 400) : "failed" },
-      { status: 502 }
-    );
+    return errorResponse(err);
   }
 }

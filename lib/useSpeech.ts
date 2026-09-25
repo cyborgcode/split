@@ -66,6 +66,10 @@ export function useSpeech(
 
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const shouldListenRef = useRef(false);
+  const committedRef = useRef<Map<number, { raw: string }>>(new Map());
+  /** Results below this index belong to text the user already cleared. */
+  const firstIndexRef = useRef(0);
+  const lastLengthRef = useRef(0);
 
   useEffect(() => {
     const Ctor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
@@ -78,21 +82,41 @@ export function useSpeech(
     rec.interimResults = true;
     rec.lang = lang;
 
+    /* Finals are committed once per result index, so the transcript is
+       append-only (findings anchor to character offsets in it). Re-reading
+       every index — not just from resultIndex — also absorbs Android
+       Chrome, which re-delivers earlier finals and sometimes repeats the
+       previous final as the prefix of the next one. */
     rec.onresult = (event) => {
+      const committed = committedRef.current;
       let interimText = "";
       let finalText = "";
-      for (let i = event.resultIndex; i < event.results.length; i++) {
+      for (let i = firstIndexRef.current; i < event.results.length; i++) {
         const result = event.results[i];
-        const raw = result[0]?.transcript ?? "";
-        const text = transform ? transform(raw) : raw;
-        if (!text.trim()) continue;
-        if (result.isFinal) finalText += text + " ";
-        else interimText += text;
+        const raw = (result[0]?.transcript ?? "").trim();
+        if (!result.isFinal) {
+          const text = transform ? transform(raw) : raw;
+          if (text.trim()) interimText += (interimText ? " " : "") + text.trim();
+          continue;
+        }
+        if (committed.has(i)) continue;
+        let fresh = raw;
+        const prev = committed.get(i - 1)?.raw;
+        if (prev && prev.length >= 12 && fresh.toLowerCase().startsWith(prev.toLowerCase())) {
+          fresh = fresh.slice(prev.length).trim();
+        }
+        // The filter runs once, when the final lands — the referee's words
+        // stay scrubbed even after it stops talking.
+        const text = transform ? transform(fresh) : fresh;
+        committed.set(i, { raw });
+        if (text.trim()) finalText += text.trim() + " ";
       }
       if (finalText) {
         setTranscript((prev) => prev + finalText);
+        setError(null); // hearing speech again — a past hiccup is over
       }
       setInterim(interimText);
+      lastLengthRef.current = event.results.length;
     };
 
     rec.onerror = (event) => {
@@ -107,10 +131,16 @@ export function useSpeech(
 
     // Chrome stops recognition after silence — restart while a session is active.
     rec.onend = () => {
+      // A new recognition session numbers its results from 0 again.
+      committedRef.current = new Map();
+      firstIndexRef.current = 0;
+      lastLengthRef.current = 0;
+      setInterim("");
       if (shouldListenRef.current) {
         try {
           rec.start();
         } catch {
+          shouldListenRef.current = false;
           setListening(false);
         }
       } else {
@@ -158,6 +188,8 @@ export function useSpeech(
   }, []);
 
   const reset = useCallback(() => {
+    // The live session keeps its old results — skip past them.
+    firstIndexRef.current = lastLengthRef.current;
     setTranscript("");
     setInterim("");
   }, []);

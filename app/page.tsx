@@ -3,29 +3,65 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSpeech } from "@/lib/useSpeech";
 import WaveBar from "@/components/WaveBar";
+import {
+  ClearIcon,
+  MicIcon,
+  MuteIcon,
+  ScaleIcon,
+  SearchIcon,
+  StopIcon,
+  VolumeIcon,
+} from "@/components/Icons";
 import type { AnalyzeResponse, FactCheckFinding, Finding } from "@/lib/types";
 
 interface PlacedFinding {
   id: number;
   finding: Finding;
-  /** Transcript length when the finding arrived — anchors it inline. */
+  /** Transcript offset the card is woven in at (just after the quote). */
   offset: number;
 }
 
-// Gemini free tier allows 15 requests/min — 5s ticks keep us safely under.
+/* Gemini's free tier allows 15 requests/min per model. Spacing requests
+   4.5s apart keeps us at ~13/min — under the cap even with network jitter. */
 const ANALYZE_INTERVAL_MS = 5000;
+const MIN_SPACING_MS = 4500;
 const MIN_CHUNK_CHARS = 40;
 const MAX_WAIT_MS = 10000;
 const CONTEXT_CHARS = 1500;
+const REPEAT_WINDOW_MS = 180000;
 
 const VERDICT_LABEL: Record<string, string> = {
-  false: "Liar alert",
+  false: "False",
   misleading: "Misleading",
   unverifiable: "Unverifiable",
 };
 
+/* Filler words say nothing about whether a phrase came from the referee. */
+const STOP_WORDS = new Set(
+  "a an and are as at be but by for from has have he her his i if in is it its of on or our she so that the their them there they this to was we were what when which who will with you your s t".split(
+    " "
+  )
+);
+
 function normalizeQuote(q: string): string {
   return q.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function modelLabel(model: string): string {
+  return model
+    .replace(/^gemini-/, "")
+    .split("-")
+    .map((w) => (/^\d/.test(w) ? w : w[0].toUpperCase() + w.slice(1)))
+    .join(" ")
+    .replace("Flash Lite", "Flash-Lite");
+}
+
+function tagLabel(f: Finding): string {
+  return f.type === "fallacy" ? f.fallacy_name : VERDICT_LABEL[f.verdict];
+}
+
+function verdictClass(f: Finding): string {
+  return `v-${f.type === "fallacy" ? "fallacy" : f.verdict}`;
 }
 
 /** What the referee says out loud when it cuts in. */
@@ -36,7 +72,7 @@ function ttsText(f: Finding): string {
   }
   const lead =
     f.verdict === "false"
-      ? "Stop right there — that's a lie! Here's the truth:"
+      ? "Stop right there — that's false! Here's the truth:"
       : f.verdict === "misleading"
         ? "Hold on — that's misleading. Actually:"
         : "Careful — that claim can't be verified.";
@@ -44,25 +80,42 @@ function ttsText(f: Finding): string {
   return `${lead} ${f.correction}${source}`;
 }
 
+/**
+ * Where a finding's card goes: right after its quote in the transcript,
+ * snapped to the end of that word. Falls back to the end of the text.
+ */
+function anchorOffset(transcript: string, quote: string, from: number): number {
+  const lower = transcript.toLowerCase();
+  const q = quote.toLowerCase().trim();
+  let idx = q ? lower.indexOf(q, Math.max(0, from - q.length)) : -1;
+  if (idx < 0 && q.length > 24) idx = lower.indexOf(q.slice(0, 24), from);
+  if (idx < 0) return transcript.length;
+  const end = idx + (lower.startsWith(q, idx) ? q.length : 24);
+  const space = transcript.indexOf(" ", end);
+  return space < 0 ? transcript.length : space;
+}
+
 type VoiceMode = "off" | "browser";
 
-interface VoicePick {
-  browser: string; // voice name, "" = auto
-}
+type AudioWindow = Window & { webkitAudioContext?: typeof AudioContext };
 
 export default function Home() {
   /* What the referee is currently saying out loud. Recognition keeps running
      while it speaks, so segments that are mostly the referee's own words are
-     scrubbed from the transcript instead of being fact-checked back at it. */
+     scrubbed from the transcript instead of being fact-checked back at it.
+     Only content words count — "that is not true" shares "that"/"is" with
+     almost any callout and must not be dropped. */
   const calloutTextRef = useRef("");
   const echoFilter = useCallback((text: string) => {
     const spoken = calloutTextRef.current;
     if (!spoken) return text;
     const spokenWords = new Set(normalizeQuote(spoken).split(" "));
-    const words = normalizeQuote(text).split(" ").filter(Boolean);
+    const words = normalizeQuote(text)
+      .split(" ")
+      .filter((w) => w && !STOP_WORDS.has(w));
     if (words.length === 0) return text;
     const matches = words.filter((w) => spokenWords.has(w)).length;
-    return matches / words.length > 0.5 ? "" : text;
+    return matches / words.length > 0.6 ? "" : text;
   }, []);
 
   const { supported, listening, transcript, interim, error, start, stop, reset } =
@@ -72,18 +125,19 @@ export default function Home() {
   const [findings, setFindings] = useState<PlacedFinding[]>([]);
   const [analyzing, setAnalyzing] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
+  const [rateLimited, setRateLimited] = useState(false);
+  const [quotaExhausted, setQuotaExhausted] = useState(false);
   const [voiceMode, setVoiceMode] = useState<VoiceMode>("browser");
-  const [voicePick, setVoicePick] = useState<VoicePick>({ browser: "" });
+  const [voiceName, setVoiceName] = useState(""); // "" = auto
   const [pickerOpen, setPickerOpen] = useState(false);
   const [browserVoices, setBrowserVoices] = useState<string[]>([]);
-  const [aiProvider, setAiProvider] = useState<"gemini" | "nvidia">("gemini");
-  const [aiAvailable, setAiAvailable] = useState({ gemini: false, nvidia: false });
   const [webSearch, setWebSearch] = useState(true);
   const [speakingFinding, setSpeakingFinding] = useState<Finding | null>(null);
   const [viewedId, setViewedId] = useState<number | null>(null);
   const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
-  const [allClear, setAllClear] = useState<string | null>(null);
-  const allClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [model, setModel] = useState("");
+  const [note, setNote] = useState<string | null>(null);
+  const noteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const transcriptRef = useRef("");
   const interimRef = useRef("");
@@ -94,22 +148,29 @@ export default function Home() {
   /** Quote → when it was last flagged; repeats re-alert after 3 minutes. */
   const seenQuotesRef = useRef<Map<string, number>>(new Map());
   const nextIdRef = useRef(1);
+  /** Bumped on reset so answers to requests sent before it are dropped. */
+  const epochRef = useRef(0);
   const voiceModeRef = useRef<VoiceMode>(voiceMode);
-  const voicePickRef = useRef<VoicePick>(voicePick);
-  const aiProviderRef = useRef<"gemini" | "nvidia">(aiProvider);
+  const voiceNameRef = useRef(voiceName);
   const webSearchRef = useRef(webSearch);
-  const sessionActiveRef = useRef(false);
   const speakQueueRef = useRef<Finding[]>([]);
   const speakingRef = useRef(false);
+  /** Bumped on stop so a callout still waiting on its alert stays silent. */
+  const speechEpochRef = useRef(0);
   const transcriptElRef = useRef<HTMLDivElement>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
 
   transcriptRef.current = transcript;
   interimRef.current = interim;
   voiceModeRef.current = voiceMode;
-  voicePickRef.current = voicePick;
-  aiProviderRef.current = aiProvider;
+  voiceNameRef.current = voiceName;
   webSearchRef.current = webSearch;
-  sessionActiveRef.current = sessionActive;
+
+  const flash = useCallback((text: string) => {
+    setNote(text);
+    if (noteTimerRef.current) clearTimeout(noteTimerRef.current);
+    noteTimerRef.current = setTimeout(() => setNote(null), 8000);
+  }, []);
 
   // Pre-pick an English TTS voice; voices often load async.
   const ttsVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
@@ -133,29 +194,28 @@ export default function Home() {
     return () => window.speechSynthesis.removeEventListener("voiceschanged", pick);
   }, []);
 
-  // Restore the voice choice from the last session.
+  // Restore device preferences.
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem("split-voice") ?? "null");
-      // older versions stored AI voice modes — anything not "off" is voiced
       if (saved?.mode) setVoiceMode(saved.mode === "off" ? "off" : "browser");
-      if (typeof saved?.pick?.browser === "string") {
-        setVoicePick({ browser: saved.pick.browser });
-      }
+      if (typeof saved?.pick?.browser === "string") setVoiceName(saved.pick.browser);
+      setWebSearch(localStorage.getItem("split-web-search") !== "off");
     } catch {
-      /* corrupted storage — keep defaults */
+      /* corrupted or blocked storage — keep defaults */
     }
   }, []);
   useEffect(() => {
     try {
       localStorage.setItem(
         "split-voice",
-        JSON.stringify({ mode: voiceMode, pick: voicePick })
+        JSON.stringify({ mode: voiceMode, pick: { browser: voiceName } })
       );
+      localStorage.setItem("split-web-search", webSearch ? "on" : "off");
     } catch {
       /* private mode — not persisted */
     }
-  }, [voiceMode, voicePick]);
+  }, [voiceMode, voiceName, webSearch]);
 
   // Verify server setup once on load so a missing key never fails silently.
   useEffect(() => {
@@ -163,84 +223,57 @@ export default function Home() {
       .then((r) => r.json())
       .then((h) => {
         setAiConfigured(!!h.ai);
-        const avail = {
-          gemini: !!h.providers?.gemini,
-          nvidia: !!h.providers?.nvidia,
-        };
-        setAiAvailable(avail);
-        // Restore last choice, but only if that provider has a key.
-        const saved = localStorage.getItem("split-ai-provider");
-        const wanted = saved === "nvidia" || saved === "gemini" ? saved : "gemini";
-        setAiProvider(
-          avail[wanted] ? wanted : avail.gemini ? "gemini" : "nvidia"
-        );
+        if (typeof h.model === "string") setModel(h.model);
       })
       .catch(() => setAiConfigured(null));
   }, []);
-  useEffect(() => {
-    try {
-      localStorage.setItem("split-ai-provider", aiProvider);
-    } catch {
-      /* private mode — not persisted */
+
+  /* ── Sounds — all on one AudioContext, unlocked by the mic tap (iOS
+     keeps contexts created outside a user gesture silent). ─────────────── */
+  const getAudioCtx = useCallback((): AudioContext | null => {
+    if (!audioCtxRef.current) {
+      const Ctx = window.AudioContext ?? (window as AudioWindow).webkitAudioContext;
+      if (!Ctx) return null;
+      audioCtxRef.current = new Ctx();
     }
-  }, [aiProvider]);
-  useEffect(() => {
-    setWebSearch(localStorage.getItem("split-web-search") !== "off");
+    const ctx = audioCtxRef.current;
+    if (ctx.state === "suspended") void ctx.resume().catch(() => {});
+    return ctx;
   }, []);
-  useEffect(() => {
-    try {
-      localStorage.setItem("split-web-search", webSearch ? "on" : "off");
-    } catch {
-      /* private mode — not persisted */
-    }
-  }, [webSearch]);
+
+  const tone = useCallback(
+    (type: OscillatorType, freqs: [number, number][], volume: number, seconds: number) => {
+      try {
+        const ctx = getAudioCtx();
+        if (!ctx) return;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = type;
+        for (const [hz, at] of freqs) osc.frequency.setValueAtTime(hz, ctx.currentTime + at);
+        gain.gain.setValueAtTime(volume, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + seconds);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start();
+        osc.stop(ctx.currentTime + seconds);
+      } catch {
+        /* audio is best-effort */
+      }
+    },
+    [getAudioCtx]
+  );
 
   const chime = useCallback(() => {
-    try {
-      type AudioWindow = Window & { webkitAudioContext?: typeof AudioContext };
-      const Ctx = window.AudioContext ?? (window as AudioWindow).webkitAudioContext;
-      if (!Ctx) return;
-      const ctx = new Ctx();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.frequency.value = 880;
-      gain.gain.setValueAtTime(0.15, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.4);
-      osc.onended = () => ctx.close();
-    } catch {
-      /* audio is best-effort */
-    }
+    tone("sine", [[880, 0]], 0.15, 0.4);
     if (navigator.vibrate) navigator.vibrate(200);
-  }, []);
+  }, [tone]);
 
   /** Sharp game-show buzzer — fallback if the alert sound file fails. */
   const buzzer = useCallback(() => {
-    try {
-      type AudioWindow = Window & { webkitAudioContext?: typeof AudioContext };
-      const Ctx = window.AudioContext ?? (window as AudioWindow).webkitAudioContext;
-      if (!Ctx) return;
-      const ctx = new Ctx();
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "square";
-      osc.frequency.setValueAtTime(220, ctx.currentTime);
-      osc.frequency.setValueAtTime(160, ctx.currentTime + 0.18);
-      gain.gain.setValueAtTime(0.3, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.45);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start();
-      osc.stop(ctx.currentTime + 0.45);
-      osc.onended = () => ctx.close();
-    } catch {
-      /* audio is best-effort */
-    }
-  }, []);
+    tone("square", [[220, 0], [160, 0.18]], 0.3, 0.45);
+  }, [tone]);
 
   /* Alert sound played before the referee speaks. Fetched once and decoded
-     lazily against the shared playback AudioContext. */
+     lazily against the shared AudioContext. */
   const alertBytesRef = useRef<ArrayBuffer | null>(null);
   const alertBufferRef = useRef<AudioBuffer | null>(null);
   const alertSourceRef = useRef<AudioBufferSourceNode | null>(null);
@@ -255,10 +288,9 @@ export default function Home() {
 
   /** Plays the alert sound to completion; falls back to the buzzer. */
   const playAlert = useCallback(async (): Promise<void> => {
-    const ctx = audioCtxRef.current;
+    const ctx = getAudioCtx();
     try {
       if (ctx) {
-        if (ctx.state === "suspended") await ctx.resume();
         if (!alertBufferRef.current && alertBytesRef.current) {
           // decodeAudioData detaches the buffer — hand it a copy
           alertBufferRef.current = await ctx.decodeAudioData(
@@ -288,27 +320,25 @@ export default function Home() {
     }
     buzzer();
     await new Promise((r) => setTimeout(r, 450));
-  }, [buzzer]);
+  }, [buzzer, getAudioCtx]);
 
   /* ── Spoken interruptions — browser speech synthesis ────────────────── */
-  const audioCtxRef = useRef<AudioContext | null>(null);
-
   const speakWithBrowserTts = useCallback((text: string): Promise<void> => {
     return new Promise((resolve) => {
       if (!("speechSynthesis" in window)) return resolve();
+      const synth = window.speechSynthesis;
       const utter = new SpeechSynthesisUtterance(text);
       utter.rate = 1.15;
       utter.volume = 1;
       utter.lang = "en-US";
-      const pickedName = voicePickRef.current.browser;
-      const picked = pickedName
-        ? window.speechSynthesis.getVoices().find((v) => v.name === pickedName)
+      const picked = voiceNameRef.current
+        ? synth.getVoices().find((v) => v.name === voiceNameRef.current)
         : null;
       const chosen = picked ?? ttsVoiceRef.current;
       if (chosen) utter.voice = chosen;
 
       // Chrome silently pauses long utterances; nudge it while speaking.
-      const keepAlive = setInterval(() => window.speechSynthesis.resume(), 4000);
+      const keepAlive = setInterval(() => synth.resume(), 4000);
       let finished = false;
       const done = () => {
         if (finished) return;
@@ -317,15 +347,22 @@ export default function Home() {
         clearTimeout(watchdog);
         resolve();
       };
-      // Some browsers never fire onend after a cancel — don't wedge the queue.
+      // Some engines never fire onend (e.g. an utterance dropped right after
+      // cancel()) — give up after roughly how long the text takes to say,
+      // instead of freezing the overlay for a fixed 25 seconds.
       const watchdog = setTimeout(() => {
-        window.speechSynthesis.cancel();
+        synth.cancel();
         done();
-      }, 25000);
+      }, 3000 + text.length * 80);
       utter.onend = done;
       utter.onerror = done;
-      window.speechSynthesis.cancel(); // clear any stuck queue first
-      window.speechSynthesis.speak(utter);
+      if (synth.speaking || synth.pending) {
+        // Chrome can drop a speak() issued in the same tick as cancel().
+        synth.cancel();
+        setTimeout(() => synth.speak(utter), 60);
+      } else {
+        synth.speak(utter);
+      }
     });
   }, []);
 
@@ -340,15 +377,16 @@ export default function Home() {
     setSpeakingFinding(next);
     if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
 
+    const speechEpoch = speechEpochRef.current;
     void (async () => {
       const text = ttsText(next);
       if (calloutClearTimerRef.current) clearTimeout(calloutClearTimerRef.current);
       calloutTextRef.current = text;
       // The alert grabs the room's attention; the voice cuts in over its
-      // tail instead of waiting for it to finish — saves ~2.5s per callout.
+      // tail instead of waiting for it to finish.
       const alertDone = playAlert();
       await new Promise((r) => setTimeout(r, 900));
-      await speakWithBrowserTts(text);
+      if (speechEpoch === speechEpochRef.current) await speakWithBrowserTts(text);
       await alertDone.catch(() => {});
       // recognition finals lag behind the audio — keep filtering briefly
       calloutClearTimerRef.current = setTimeout(() => {
@@ -382,9 +420,9 @@ export default function Home() {
   }, []);
 
   /* ── Analysis loop ──────────────────────────────────────────────────── */
-  /** Swap in a live web-search source once it lands — never blocks the callout. */
+  /** Swap in a live source once it lands — never blocks the callout. */
   const enrichSource = useCallback((id: number, f: FactCheckFinding) => {
-    if (!webSearchRef.current) return; // 🔍 toggled off — keep the AI's citation
+    if (!webSearchRef.current) return; // toggled off — keep the AI's citation
     const query = f.search_query || f.correction;
     fetch("/api/source", {
       method: "POST",
@@ -418,7 +456,7 @@ export default function Home() {
     if (inFlightRef.current) return;
     if (Date.now() < cooldownUntilRef.current) return; // backing off a rate limit
     // Event-driven ticks can fire often — keep request spacing quota-safe.
-    if (!force && Date.now() - lastSentAtRef.current < 4000) return;
+    if (!force && Date.now() - lastSentAtRef.current < MIN_SPACING_MS) return;
     const finalText = transcriptRef.current;
     // Include words still being spoken so continuous talkers get checked
     // without waiting for a pause. Only finalized text advances the analyzed
@@ -439,59 +477,69 @@ export default function Home() {
     inFlightRef.current = true;
     lastChunkRef.current = chunk;
     lastSentAtRef.current = Date.now();
+    const sentFrom = analyzedRef.current;
     const sentUpTo = finalText.length;
+    const epoch = epochRef.current;
     setAnalyzing(true);
     try {
       const context = finalText
-        .slice(Math.max(0, analyzedRef.current - CONTEXT_CHARS), analyzedRef.current)
+        .slice(Math.max(0, sentFrom - CONTEXT_CHARS), sentFrom)
         .trim();
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chunk,
-          context,
-          provider: aiProviderRef.current,
-        }),
+        body: JSON.stringify({ chunk, context }),
         signal: AbortSignal.timeout(28000),
       });
+      if (epoch !== epochRef.current) return; // cleared while in flight
       if (!res.ok) {
         lastChunkRef.current = ""; // failed — let the next tick retry this chunk
-        if (res.status === 429 || res.status === 503 || res.status === 504) {
-          // transient rate limit / overload / timeout — back off quietly
-          cooldownUntilRef.current =
-            Date.now() + (res.status === 504 ? 8000 : 20000);
+        const data = await res.json().catch(() => null);
+        if (res.status === 429 && data?.daily_quota) {
+          // Every model's daily cap is spent — poll gently until it resets.
+          setQuotaExhausted(true);
+          cooldownUntilRef.current = Date.now() + 60000;
           return;
         }
-        const data = await res.json().catch(() => null);
+        if (res.status === 429 || res.status === 503 || res.status === 504) {
+          // transient rate limit / overload / timeout — back off quietly
+          setRateLimited(true);
+          cooldownUntilRef.current = Date.now() + (res.status === 429 ? 15000 : 6000);
+          return;
+        }
         setApiError(data?.error ?? `Analysis failed (HTTP ${res.status})`);
         return;
       }
       setApiError(null);
+      setRateLimited(false);
+      setQuotaExhausted(false);
       analyzedRef.current = sentUpTo;
       pendingSinceRef.current = null;
 
       const data: AnalyzeResponse = await res.json();
+      if (data.model) setModel(data.model);
       const now = Date.now();
       const fresh = data.findings.filter((f) => {
         const key = `${f.type}:${normalizeQuote(f.quote)}`;
         const lastFlagged = seenQuotesRef.current.get(key);
-        if (lastFlagged && now - lastFlagged < 180000) return false;
+        if (lastFlagged && now - lastFlagged < REPEAT_WINDOW_MS) return false;
         seenQuotesRef.current.set(key, now);
         return true;
       });
-      const note = (text: string) => {
-        setAllClear(text);
-        if (allClearTimerRef.current) clearTimeout(allClearTimerRef.current);
-        allClearTimerRef.current = setTimeout(() => setAllClear(null), 8000);
-      };
       if (fresh.length > 0) {
-        const placed = fresh.map((finding) => ({
-          id: nextIdRef.current++,
-          finding,
-          offset: sentUpTo,
-        }));
-        setFindings((prev) => [...prev, ...placed]);
+        const text = transcriptRef.current;
+        const placed = fresh
+          .map((finding) => ({
+            id: nextIdRef.current++,
+            finding,
+            offset: anchorOffset(text, finding.quote, sentFrom),
+          }))
+          .sort((a, b) => a.offset - b.offset);
+        setFindings((prev) => {
+          // Cards render in order, so never anchor before an earlier card.
+          const floor = prev.length ? prev[prev.length - 1].offset : 0;
+          return [...prev, ...placed.map((p) => ({ ...p, offset: Math.max(p.offset, floor) }))];
+        });
         // Speak first; live sources swap in whenever the search lands.
         for (const p of placed) {
           if (p.finding.type === "fact_check") enrichSource(p.id, p.finding);
@@ -499,22 +547,26 @@ export default function Home() {
         interrupt(fresh);
       } else if (data.findings.length > 0) {
         // Flagged, but identical to a recent callout — don't claim "accurate".
-        note("⚠ repeated claim — already called out");
+        flash("Repeated claim — already called out");
       } else if ((data.claims_checked ?? 0) > 0) {
         // Prove the referee is working even when nobody is wrong.
         const n = data.claims_checked!;
-        note(`✓ ${n} claim${n === 1 ? "" : "s"} checked — all accurate`);
+        flash(`${n} claim${n === 1 ? "" : "s"} checked — all accurate`);
       }
     } catch {
+      if (epoch !== epochRef.current) return;
       lastChunkRef.current = ""; // failed — let the next tick retry this chunk
       setApiError("Network error while analyzing. Retrying…");
     } finally {
-      inFlightRef.current = false;
-      setAnalyzing(false);
+      if (epoch === epochRef.current) {
+        inFlightRef.current = false;
+        setAnalyzing(false);
+      }
     }
-  }, [interrupt, enrichSource]);
+  }, [interrupt, enrichSource, flash]);
 
-  // Fallback ticker — catches long unfinalized monologues.
+  // Fallback ticker — catches long unfinalized monologues and retries
+  // after a cooldown even if nobody says anything new.
   useEffect(() => {
     if (!sessionActive) return;
     const timer = setInterval(() => void analyze(), ANALYZE_INTERVAL_MS);
@@ -533,12 +585,9 @@ export default function Home() {
     setApiError(null);
     setSessionActive(true);
     // Unlock audio output on this user gesture (required on iOS): resume the
-    // playback AudioContext for the alert sound and speak a silent utterance
-    // so browser speech synthesis is also allowed for later callouts.
-    type AudioWindow = Window & { webkitAudioContext?: typeof AudioContext };
-    const Ctx = window.AudioContext ?? (window as AudioWindow).webkitAudioContext;
-    if (Ctx && !audioCtxRef.current) audioCtxRef.current = new Ctx();
-    void audioCtxRef.current?.resume().catch(() => {});
+    // shared AudioContext and speak a silent utterance so later callouts
+    // are allowed to make sound.
+    getAudioCtx();
     if ("speechSynthesis" in window) {
       window.speechSynthesis.cancel();
       const unlock = new SpeechSynthesisUtterance(" ");
@@ -546,10 +595,12 @@ export default function Home() {
       window.speechSynthesis.speak(unlock);
     }
     start();
-  }, [start]);
+  }, [start, getAudioCtx]);
 
+  const flushTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const handleStop = useCallback(() => {
     setSessionActive(false);
+    speechEpochRef.current++;
     speakQueueRef.current = [];
     window.speechSynthesis?.cancel();
     try {
@@ -558,25 +609,49 @@ export default function Home() {
       /* already stopped */
     }
     stop();
-    pendingSinceRef.current = 0; // force the final short chunk through
-    void analyze(true);
+    // The last words finalize a beat after stop(), and a request may still
+    // be in flight — try the final short chunk a few times so it isn't lost.
+    flushTimersRef.current.forEach(clearTimeout);
+    flushTimersRef.current = [0, 1200, 3000, 6000].map((ms) =>
+      setTimeout(() => {
+        pendingSinceRef.current = 0;
+        void analyze(true);
+      }, ms)
+    );
   }, [stop, analyze]);
 
   const handleReset = useCallback(() => {
+    flushTimersRef.current.forEach(clearTimeout);
+    epochRef.current++;
+    inFlightRef.current = false;
+    setAnalyzing(false);
     reset();
     setFindings([]);
     setApiError(null);
+    setNote(null);
     analyzedRef.current = 0;
     lastChunkRef.current = "";
     pendingSinceRef.current = null;
     seenQuotesRef.current.clear();
   }, [reset]);
 
-  // Keep the newest words in view.
+  // Keep the newest words in view — unless the reader scrolled up.
+  const stickToBottomRef = useRef(true);
   useEffect(() => {
     const el = transcriptElRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && stickToBottomRef.current) el.scrollTop = el.scrollHeight;
   }, [transcript, interim, findings]);
+
+  // Close overlays with Escape.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setPickerOpen(false);
+      setViewedId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   /* ── Render: transcript with findings woven in at their offsets ─────── */
   // Looked-up live so background source updates show in the open overlay.
@@ -594,17 +669,13 @@ export default function Home() {
     segments.push(
       <span
         key={`f${pf.id}`}
-        className={`inline-card v-${f.type === "fallacy" ? "fallacy" : f.verdict}`}
+        className={`inline-card ${verdictClass(f)}`}
         role="button"
         tabIndex={0}
         onClick={() => setViewedId(pf.id)}
         onKeyDown={(e) => e.key === "Enter" && setViewedId(pf.id)}
       >
-        <span className="tag">
-          {f.type === "fallacy"
-            ? `⚠ ${f.fallacy_name}`
-            : `✗ ${VERDICT_LABEL[f.verdict]}`}
-        </span>
+        <span className="tag">{tagLabel(f)}</span>
         <span className="body">
           {f.type === "fallacy" ? f.explanation : f.correction}
         </span>
@@ -629,28 +700,100 @@ export default function Home() {
   }
   const tailText = transcript.slice(cursor).trim();
 
+  const factCount = findings.filter((pf) => pf.finding.type === "fact_check").length;
+  const fallacyCount = findings.length - factCount;
+
+  const status = speakingFinding
+    ? { text: "Referee speaking", tone: "alert" }
+    : !sessionActive
+      ? { text: "Mic off", tone: "idle" }
+      : quotaExhausted
+        ? { text: "Daily quota used up", tone: "warn" }
+        : rateLimited
+          ? { text: "Gemini busy — retrying", tone: "warn" }
+          : analyzing
+            ? { text: "Fact-checking", tone: "busy" }
+            : !listening
+              ? { text: "Paused", tone: "idle" }
+              : note
+                ? { text: note, tone: "ok" }
+                : { text: "Listening", tone: "live" };
+
+  const overlayFinding = speakingFinding ?? viewedFinding;
+
   return (
     <main className="stage">
+      <header className="topbar">
+        <div className="brand">
+          <ScaleIcon size={20} />
+          <span>Split</span>
+        </div>
+        <div className="topbar-right">
+          {findings.length > 0 && (
+            <span className="counts" aria-label="Callouts so far">
+              {factCount > 0 && (
+                <span className="count v-false">
+                  {factCount} claim{factCount === 1 ? "" : "s"}
+                </span>
+              )}
+              {fallacyCount > 0 && (
+                <span className="count v-fallacy">
+                  {fallacyCount} fallac{fallacyCount === 1 ? "y" : "ies"}
+                </span>
+              )}
+            </span>
+          )}
+          {model && aiConfigured !== false && (
+            <span className="model-chip" title={`Fact-checking with ${model}`}>
+              {modelLabel(model)}
+            </span>
+          )}
+        </div>
+      </header>
+
       {aiConfigured === false && (
-        <div className="setup-banner">
-          <strong>Setup needed:</strong> no AI key is configured, so nothing will
-          be fact-checked. Add <code>GEMINI_API_KEY</code> (free at{" "}
+        <div className="banner warn">
+          <strong>Setup needed:</strong> no Gemini key is configured, so nothing
+          will be fact-checked. Add <code>GEMINI_API_KEY</code> (free at{" "}
           <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">
             aistudio.google.com/apikey
           </a>
-          ) or <code>NVIDIA_NIM_API_KEY</code> to your environment variables and
-          redeploy. Web-search keys are optional.
+          ) to your environment variables and redeploy.
         </div>
       )}
       {!supported && (
-        <div className="setup-banner">
+        <div className="banner warn">
           This browser doesn&apos;t support live speech recognition. Use Chrome,
           Edge, or Safari.
         </div>
       )}
-      {(error || apiError) && <div className="error-banner">{error ?? apiError}</div>}
+      {quotaExhausted && (
+        <div className="banner warn">
+          Today&apos;s free Gemini quota is used up. Listening continues, and
+          fact-checking resumes by itself when the quota resets at midnight
+          Pacific time.
+        </div>
+      )}
+      {(error || apiError) && (
+        <div className="banner error" role="alert">
+          <span>{error ?? apiError}</span>
+          {apiError && !error && (
+            <button className="banner-close" onClick={() => setApiError(null)} aria-label="Dismiss">
+              ×
+            </button>
+          )}
+        </div>
+      )}
 
-      <div className="transcript" ref={transcriptElRef}>
+      <div
+        className="transcript"
+        ref={transcriptElRef}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          stickToBottomRef.current =
+            el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        }}
+      >
         {transcript || interim || findings.length > 0 ? (
           <p>
             {segments}
@@ -659,12 +802,18 @@ export default function Home() {
           </p>
         ) : (
           <div className="hint">
-            <div className="mark">⚖️</div>
+            <div className="mark">
+              <ScaleIcon size={40} />
+            </div>
+            <h1>Your AI debate referee</h1>
             <p>
-              Place the phone between you, press the mic, and debate. Everything
-              said appears here — and when someone gets a fact wrong or slips
-              into a fallacy, the referee interrupts out loud with the
-              correction and its source.
+              Place the phone between you, tap the mic, and argue. When someone
+              gets a fact wrong or slips into a fallacy, the referee cuts in out
+              loud with the correction and a source.
+            </p>
+            <p className="try">
+              Try saying: <em>&ldquo;The Great Wall of China is visible from the
+              Moon.&rdquo;</em>
             </p>
           </div>
         )}
@@ -677,69 +826,59 @@ export default function Home() {
             <button
               className={`side-btn ${voiceMode !== "off" ? "active" : ""}`}
               onClick={() => setPickerOpen(true)}
-              title="Choose the referee's voice"
+              title="Referee voice"
+              aria-label="Referee voice"
             >
-              {voiceMode === "off" ? "🔇" : "🔊"}
+              {voiceMode === "off" ? <MuteIcon /> : <VolumeIcon />}
             </button>
             <button
-              className="side-btn"
-              disabled={!(aiAvailable.gemini && aiAvailable.nvidia)}
-              onClick={() =>
-                setAiProvider((p) => (p === "gemini" ? "nvidia" : "gemini"))
-              }
+              className={`side-btn ${webSearch ? "active" : ""}`}
+              onClick={() => setWebSearch((s) => !s)}
+              aria-pressed={webSearch}
+              aria-label="Live source lookup"
               title={
-                aiAvailable.gemini && aiAvailable.nvidia
-                  ? "Switch the fact-checking AI"
-                  : "Set both GEMINI_API_KEY and NVIDIA_NIM_API_KEY to switch"
+                webSearch
+                  ? "Source lookup on — cards link a live Wikipedia page"
+                  : "Source lookup off — cards cite the AI's own source"
               }
             >
-              🧠
-              <span className="btn-badge">
-                {aiProvider === "gemini" ? "G" : "N"}
-              </span>
+              <SearchIcon off={!webSearch} />
             </button>
           </div>
           <button
             className={`mic-btn ${sessionActive ? "listening" : ""}`}
             onClick={sessionActive ? handleStop : handleStart}
             disabled={!supported}
-            aria-label={sessionActive ? "Stop" : "Start listening"}
+            aria-label={sessionActive ? "Stop listening" : "Start listening"}
           >
-            {sessionActive ? "■" : "🎙"}
+            {sessionActive ? <StopIcon size={24} /> : <MicIcon size={26} />}
           </button>
           <div className="controls-side right">
             <button
-              className={`side-btn ${webSearch ? "active" : ""}`}
-              onClick={() => setWebSearch((s) => !s)}
-              title={
-                webSearch
-                  ? "Web search on — sources come from a live search"
-                  : "Web search off — sources come from the AI's memory (faster)"
-              }
+              className="side-btn"
+              onClick={handleReset}
+              disabled={!transcript && !interim && findings.length === 0}
+              title="Clear transcript"
+              aria-label="Clear transcript"
             >
-              🔍
-            </button>
-            <button className="side-btn" onClick={handleReset} title="Clear session">
-              ✕
+              <ClearIcon />
             </button>
           </div>
         </div>
-        <div className={`status ${analyzing ? "thinking" : ""}`}>
-          {speakingFinding
-            ? "Referee speaking…"
-            : analyzing
-              ? "Fact-checking…"
-              : sessionActive
-                ? listening
-                  ? (allClear ?? "Listening")
-                  : "Paused"
-                : "Mic off"}
+        <div className={`status tone-${status.tone}`} aria-live="polite">
+          <span className="dot" />
+          {status.text}
         </div>
       </div>
 
       {pickerOpen && (
         <div className="picker-overlay" onClick={() => setPickerOpen(false)}>
-          <div className="picker-card" onClick={(e) => e.stopPropagation()}>
+          <div
+            className="picker-card"
+            role="dialog"
+            aria-label="Referee voice"
+            onClick={(e) => e.stopPropagation()}
+          >
             <h2>Referee voice</h2>
 
             <label className={`picker-row ${voiceMode === "browser" ? "selected" : ""}`}>
@@ -750,17 +889,16 @@ export default function Home() {
                 onChange={() => setVoiceMode("browser")}
               />
               <span className="row-main">
-                <span className="row-title">Browser voice</span>
-                <span className="row-sub">Free, instant, on-device (default)</span>
+                <span className="row-title">Speak callouts</span>
+                <span className="row-sub">Built-in browser voice — free and on-device</span>
               </span>
             </label>
             {voiceMode === "browser" && browserVoices.length > 0 && (
               <select
                 className="picker-select"
-                value={voicePick.browser}
-                onChange={(e) =>
-                  setVoicePick((p) => ({ ...p, browser: e.target.value }))
-                }
+                value={voiceName}
+                onChange={(e) => setVoiceName(e.target.value)}
+                aria-label="Voice"
               >
                 <option value="">Auto (recommended)</option>
                 {browserVoices.map((name) => (
@@ -779,7 +917,7 @@ export default function Home() {
                 onChange={() => setVoiceMode("off")}
               />
               <span className="row-main">
-                <span className="row-title">Off</span>
+                <span className="row-title">Silent</span>
                 <span className="row-sub">Chime + vibration only</span>
               </span>
             </label>
@@ -787,16 +925,17 @@ export default function Home() {
             <div className="picker-actions">
               <button
                 className="side-btn"
-                disabled={voiceMode === "off" || speakingRef.current}
+                disabled={voiceMode === "off" || !!speakingFinding}
                 onClick={() => {
+                  getAudioCtx();
                   void speakWithBrowserTts(
                     "Fact check. This is your debate referee speaking."
                   );
                 }}
               >
-                ▶ Test voice
+                Test voice
               </button>
-              <button className="side-btn active" onClick={() => setPickerOpen(false)}>
+              <button className="side-btn primary" onClick={() => setPickerOpen(false)}>
                 Done
               </button>
             </div>
@@ -804,79 +943,58 @@ export default function Home() {
         </div>
       )}
 
-      {viewedFinding && !speakingFinding && (
-        <div className="interrupt-overlay" onClick={() => setViewedId(null)}>
+      {overlayFinding && (
+        <div
+          className="interrupt-overlay"
+          onClick={speakingFinding ? skipSpeaking : () => setViewedId(null)}
+        >
           <div
-            className={`interrupt-card v-${
-              viewedFinding.type === "fallacy" ? "fallacy" : viewedFinding.verdict
-            }`}
-            onClick={(e) => e.stopPropagation()}
+            className={`interrupt-card ${verdictClass(overlayFinding)}`}
+            role="dialog"
+            aria-live="assertive"
+            onClick={speakingFinding ? undefined : (e) => e.stopPropagation()}
           >
-            <span className="tag">
-              {viewedFinding.type === "fallacy"
-                ? `⚠ ${viewedFinding.fallacy_name}`
-                : `✗ ${VERDICT_LABEL[viewedFinding.verdict]}`}
-            </span>
-            <blockquote>&ldquo;{viewedFinding.quote}&rdquo;</blockquote>
+            <span className="tag">{tagLabel(overlayFinding)}</span>
+            <blockquote>&ldquo;{overlayFinding.quote}&rdquo;</blockquote>
             <div className="body">
-              {viewedFinding.type === "fallacy"
-                ? viewedFinding.explanation
-                : viewedFinding.correction}
+              {overlayFinding.type === "fallacy"
+                ? overlayFinding.explanation
+                : overlayFinding.correction}
             </div>
-            {viewedFinding.type === "fact_check" && viewedFinding.source_name && (
+            {overlayFinding.type === "fact_check" && overlayFinding.source_name && (
               <div className="source">
                 Source:{" "}
-                {viewedFinding.source_url ? (
-                  <a href={viewedFinding.source_url} target="_blank" rel="noreferrer">
-                    {viewedFinding.source_name}
+                {overlayFinding.source_url && !speakingFinding ? (
+                  <a href={overlayFinding.source_url} target="_blank" rel="noreferrer">
+                    {overlayFinding.source_name}
                   </a>
                 ) : (
-                  viewedFinding.source_name
+                  overlayFinding.source_name
                 )}
               </div>
             )}
-            <div className="picker-actions">
-              <button
-                className="side-btn"
-                onClick={() => {
-                  const f = viewedFinding;
-                  setViewedId(null);
-                  speakQueueRef.current.push(f);
-                  drainSpeakQueue();
-                }}
-              >
-                🔊 Replay
-              </button>
-              <button className="side-btn active" onClick={() => setViewedId(null)}>
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {speakingFinding && (
-        <div className="interrupt-overlay" onClick={skipSpeaking}>
-          <div
-            className={`interrupt-card v-${
-              speakingFinding.type === "fallacy" ? "fallacy" : speakingFinding.verdict
-            }`}
-          >
-            <span className="tag">
-              {speakingFinding.type === "fallacy"
-                ? `⚠ ${speakingFinding.fallacy_name}`
-                : `✗ ${VERDICT_LABEL[speakingFinding.verdict]}`}
-            </span>
-            <blockquote>&ldquo;{speakingFinding.quote}&rdquo;</blockquote>
-            <div className="body">
-              {speakingFinding.type === "fallacy"
-                ? speakingFinding.explanation
-                : speakingFinding.correction}
-            </div>
-            {speakingFinding.type === "fact_check" && speakingFinding.source_name && (
-              <div className="source">Source: {speakingFinding.source_name}</div>
+            {speakingFinding ? (
+              <div className="skip">Tap anywhere to skip</div>
+            ) : (
+              <div className="picker-actions">
+                <button
+                  className="side-btn"
+                  disabled={voiceMode === "off"}
+                  onClick={() => {
+                    const f = overlayFinding;
+                    setViewedId(null);
+                    getAudioCtx();
+                    speakQueueRef.current.push(f);
+                    drainSpeakQueue();
+                  }}
+                >
+                  Replay
+                </button>
+                <button className="side-btn primary" onClick={() => setViewedId(null)}>
+                  Close
+                </button>
+              </div>
             )}
-            <div className="skip">tap to skip</div>
           </div>
         </div>
       )}

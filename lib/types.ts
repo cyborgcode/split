@@ -25,13 +25,12 @@ export interface AnalyzeRequest {
   chunk: string;
   /** Recent transcript before the chunk, for context only. */
   context?: string;
-  /** Which AI checks the claims; omitted = whatever is configured. */
-  provider?: "gemini" | "nvidia";
 }
 
 export interface AnalyzeResponse {
   findings: Finding[];
   /** Factual claims the model evaluated in this chunk, including accurate ones. */
   claims_checked?: number;
-  provider: string;
+  /** Gemini model that answered. */
+  model?: string;
 }

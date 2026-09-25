@@ -1,10 +1,12 @@
 :root {
   --bg: #0b0d12;
   --panel: #131722;
+  --panel-2: #1a2030;
   --border: #262e42;
   --text: #e8ecf4;
   --muted: #8b94a8;
-  --accent: #5b8cff;
+  --accent: #6d8dff;
+  --ok: #4ade80;
   --false: #ff5d6c;
   --false-bg: rgba(255, 93, 108, 0.1);
   --misleading: #ffb454;
@@ -55,42 +57,120 @@ a {
   margin: 0 auto;
 }
 
-/* ── Banners ────────────────────────────────────────────── */
-.setup-banner,
-.error-banner {
+/* ── Top bar ────────────────────────────────────────────── */
+.topbar {
   flex-shrink: 0;
-  margin: 10px 14px 0;
-  padding: 12px 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: calc(12px + env(safe-area-inset-top)) 16px 10px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 17px;
+  letter-spacing: 0.2px;
+}
+
+.brand svg {
+  color: var(--accent);
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.counts {
+  display: flex;
+  gap: 6px;
+}
+
+.count,
+.model-chip {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.count.v-false {
+  color: var(--false);
+  background: var(--false-bg);
+}
+
+.count.v-fallacy {
+  color: var(--fallacy);
+  background: var(--fallacy-bg);
+}
+
+.model-chip {
+  color: var(--muted);
+  background: var(--panel);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Banners ────────────────────────────────────────────── */
+.banner {
+  flex-shrink: 0;
+  margin: 0 14px 8px;
+  padding: 11px 14px;
   border-radius: 12px;
   font-size: 14px;
   line-height: 1.5;
 }
 
-.setup-banner {
-  border: 1px solid var(--misleading);
+.banner.error {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.banner.warn {
+  border: 1px solid rgba(255, 180, 84, 0.45);
   background: var(--misleading-bg);
   color: var(--misleading);
 }
 
-.setup-banner code {
+.banner code {
   font-size: 13px;
   background: rgba(0, 0, 0, 0.3);
   padding: 1px 5px;
   border-radius: 5px;
 }
 
-.error-banner {
-  border: 1px solid var(--false);
+.banner.error {
+  border: 1px solid rgba(255, 93, 108, 0.45);
   background: var(--false-bg);
   color: var(--false);
+  word-break: break-word;
+}
+
+.banner-close {
+  flex-shrink: 0;
+  font-size: 20px;
+  line-height: 1;
+  padding: 0 4px;
+  opacity: 0.8;
 }
 
 /* ── Full-page transcript ───────────────────────────────── */
 .transcript {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
-  padding: 24px 20px;
-  font-size: 21px;
+  padding: 12px 20px 24px;
+  font-size: 20px;
   line-height: 1.65;
   scroll-behavior: smooth;
 }
@@ -100,7 +180,7 @@ a {
 }
 
 .transcript .hint {
-  height: 100%;
+  min-height: 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -109,18 +189,45 @@ a {
   color: var(--muted);
   font-size: 15px;
   line-height: 1.6;
-  max-width: 430px;
+  max-width: 420px;
   margin: 0 auto;
+  gap: 12px;
 }
 
 .transcript .hint .mark {
-  font-size: 44px;
-  margin-bottom: 14px;
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  background: rgba(109, 141, 255, 0.1);
+  border: 1px solid rgba(109, 141, 255, 0.25);
+  margin-bottom: 4px;
+}
+
+.transcript .hint h1 {
+  font-size: 22px;
+  color: var(--text);
+  font-weight: 700;
+}
+
+.transcript .hint .try {
+  font-size: 13px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  border: 1px dashed var(--border);
+}
+
+.transcript .hint .try em {
+  color: var(--text);
 }
 
 /* ── Findings woven into the transcript ─────────────────── */
 .inline-card {
   display: block;
+  border-left-width: 4px !important;
   margin: 14px 0;
   padding: 12px 14px;
   border-radius: 12px;
@@ -135,7 +242,7 @@ a {
 
 .inline-card:hover,
 .inline-card:focus-visible {
-  background: var(--panel-2, #1a2030);
+  background: var(--panel-2);
   outline: none;
 }
 
@@ -187,6 +294,9 @@ a {
   color: var(--misleading);
   background: var(--misleading-bg);
 }
+.v-unverifiable {
+  border-color: var(--unverifiable) !important;
+}
 .v-unverifiable .tag {
   color: var(--unverifiable);
   background: var(--unverifiable-bg);
@@ -203,6 +313,7 @@ a {
 .dock {
   flex-shrink: 0;
   border-top: 1px solid var(--border);
+  background: linear-gradient(to bottom, rgba(19, 23, 34, 0.6), var(--bg));
   padding: 10px 16px calc(12px + env(safe-area-inset-bottom));
   display: flex;
   flex-direction: column;
@@ -234,29 +345,15 @@ a {
 /* icon-only circles in the control bar (labelled buttons elsewhere keep
    the default .side-btn look) */
 .controls .side-btn {
-  width: 42px;
-  height: 42px;
+  width: 44px;
+  height: 44px;
   min-width: 0;
   padding: 0;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 17px;
   position: relative;
-}
-
-.btn-badge {
-  position: absolute;
-  bottom: -3px;
-  right: -3px;
-  font-size: 9px;
-  font-weight: 800;
-  line-height: 1;
-  padding: 2px 4px;
-  border-radius: 999px;
-  background: var(--accent);
-  color: #fff;
 }
 
 .controls-side.left {
@@ -268,16 +365,22 @@ a {
 }
 
 .mic-btn {
-  width: 62px;
-  height: 62px;
+  width: 66px;
+  height: 66px;
   border-radius: 50%;
-  font-size: 24px;
   background: var(--accent);
+  box-shadow: 0 6px 20px rgba(109, 141, 255, 0.35);
   color: #fff;
   display: flex;
   align-items: center;
   justify-content: center;
   transition: background 0.2s, transform 0.1s;
+}
+
+.mic-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  box-shadow: none;
 }
 
 .mic-btn:active {
@@ -309,6 +412,23 @@ a {
   min-width: 40px;
 }
 
+.side-btn:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+button:focus-visible,
+.inline-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.side-btn.primary {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
 .side-btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -320,12 +440,55 @@ a {
 }
 
 .status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   font-size: 12px;
   color: var(--muted);
+  min-height: 16px;
 }
 
-.status.thinking {
+.status .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.8;
+}
+
+.status.tone-live {
+  color: var(--ok);
+}
+.status.tone-live .dot,
+.status.tone-busy .dot {
+  animation: blink 1.2s ease-in-out infinite;
+}
+.status.tone-busy {
   color: var(--accent);
+}
+.status.tone-ok {
+  color: var(--ok);
+}
+.status.tone-warn {
+  color: var(--misleading);
+}
+.status.tone-alert {
+  color: var(--false);
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
 }
 
 /* ── Voice picker ───────────────────────────────────────── */
@@ -447,7 +610,10 @@ a {
 .interrupt-card {
   width: 100%;
   max-width: 440px;
+  max-height: calc(100dvh - 48px);
+  overflow-y: auto;
   border: 1px solid var(--border);
+  border-top-width: 4px !important;
   border-radius: 18px;
   background: var(--panel);
   padding: 22px;

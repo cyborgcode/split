@@ -65,8 +65,8 @@ export default function WaveBar({ active }: { active: boolean }) {
         }
         const barH = Math.max(3, level * (h - 6));
         ctx2d.fillStyle = talking
-          ? `rgba(91, 140, 255, ${0.45 + level * 0.55})`
-          : "rgba(78, 90, 120, 0.45)";
+          ? `rgba(124, 156, 255, ${0.45 + level * 0.55})`
+          : "rgba(120, 132, 160, 0.3)";
         const x = i * (barW + gap);
         const r = Math.min(barW / 2, 3);
         ctx2d.beginPath();
@@ -86,6 +86,9 @@ export default function WaveBar({ active }: { active: boolean }) {
           }
           stream = s;
           audioCtx = new AudioContext();
+          // iOS starts contexts created outside a tap suspended — bars would
+          // never move. The mic tap that got us here allows resuming.
+          void audioCtx.resume().catch(() => {});
           analyser = audioCtx.createAnalyser();
           analyser.fftSize = 512;
           analyser.smoothingTimeConstant = 0.75;

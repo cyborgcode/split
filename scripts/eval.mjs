@@ -79,6 +79,6 @@ for (const control of CONTROLS) {
 console.log(`\nScore: ${caught}/${MYTHS.length} myths caught, ${falseAlarms} false alarms.`);
 if (caught < 8) {
   console.log(
-    "Low recall → try a stronger model: set GEMINI_MODEL=gemini-3.5-flash (note: ~20 req/day free)."
+    "Low recall → try a stronger model: set GEMINI_MODEL=gemini-3.8-flash (note: ~20 req/day free)."
   );
 }
