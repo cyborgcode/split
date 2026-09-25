@@ -35,10 +35,13 @@ declare global {
   }
 }
 
+/** Silence longer than this between utterances starts a new line. */
+const PAUSE_BREAK_MS = 1500;
+
 export interface UseSpeechResult {
   supported: boolean;
   listening: boolean;
-  /** All finalized speech so far, concatenated. */
+  /** All finalized speech so far. Append-only; "\n" marks a long pause. */
   transcript: string;
   /** Words currently being spoken (not yet finalized). */
   interim: string;
@@ -70,6 +73,10 @@ export function useSpeech(
   /** Results below this index belong to text the user already cleared. */
   const firstIndexRef = useRef(0);
   const lastLengthRef = useRef(0);
+  const lastFinalAtRef = useRef(0);
+  /** An interim utterance is in progress. */
+  const speakingRef = useRef(false);
+  const breakPendingRef = useRef(false);
 
   useEffect(() => {
     const Ctor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
@@ -89,6 +96,7 @@ export function useSpeech(
        previous final as the prefix of the next one. */
     rec.onresult = (event) => {
       const committed = committedRef.current;
+      const now = Date.now();
       let interimText = "";
       let finalText = "";
       for (let i = firstIndexRef.current; i < event.results.length; i++) {
@@ -111,8 +119,19 @@ export function useSpeech(
         committed.set(i, { raw });
         if (text.trim()) finalText += text.trim() + " ";
       }
+      // A new utterance after a real silence usually means the other side
+      // is answering — mark it with a line break so both the reader and
+      // the model can follow the turns of the conversation.
+      if (!speakingRef.current && (interimText || finalText)) {
+        const last = lastFinalAtRef.current;
+        if (last && now - last > PAUSE_BREAK_MS) breakPendingRef.current = true;
+      }
+      speakingRef.current = !!interimText;
       if (finalText) {
-        setTranscript((prev) => prev + finalText);
+        const brk = breakPendingRef.current;
+        breakPendingRef.current = false;
+        lastFinalAtRef.current = now;
+        setTranscript((prev) => prev + (brk && prev ? "\n" : "") + finalText);
         setError(null); // hearing speech again — a past hiccup is over
       }
       setInterim(interimText);
@@ -135,6 +154,7 @@ export function useSpeech(
       committedRef.current = new Map();
       firstIndexRef.current = 0;
       lastLengthRef.current = 0;
+      speakingRef.current = false;
       setInterim("");
       if (shouldListenRef.current) {
         try {
@@ -190,6 +210,8 @@ export function useSpeech(
   const reset = useCallback(() => {
     // The live session keeps its old results — skip past them.
     firstIndexRef.current = lastLengthRef.current;
+    lastFinalAtRef.current = 0;
+    breakPendingRef.current = false;
     setTranscript("");
     setInterim("");
   }, []);

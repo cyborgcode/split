@@ -20,8 +20,15 @@ No alerts means the debate is clean. Better debates for both sides.
 
 1. The browser's built-in **Web Speech API** transcribes the debate live on
    your phone — no audio ever leaves the device.
-2. Every few seconds, the new slice of transcript is sent to a serverless API
-   route (`/api/analyze`).
+2. Checks follow the rhythm of the conversation: the new words are sent to
+   a serverless API route (`/api/analyze`) at natural pauses — never
+   mid-sentence — together with the conversation so far, so a claim split
+   by a pause is rebuilt whole and fallacies like a straw man can be judged
+   against what the other side actually said. A sentence that trails off
+   ("…the Great Wall of China is") is held until it finishes. Long silences
+   start a new line in the transcript (usually a change of speaker). As the
+   debate builds context, shorter phrases are checked and held for less
+   time, so the referee answers faster.
 3. The route asks **Google Gemini** (free tier, `gemini-3.5-flash-lite`) to
    judge every factual claim and flag clear-cut fallacies, and returns
    structured JSON.
@@ -87,8 +94,9 @@ Open `http://localhost:3000`, allow microphone access, press
   error message. Per-minute rate limits back off quietly ("Gemini busy —
   retrying"); if the **daily** quota is used up on every model, a banner says
   so and checking resumes by itself after midnight Pacific.
-- Analysis runs as soon as ~40 characters of speech accumulate (at most one
-  request every 4.5 seconds) — say a full sentence or two and give it a beat.
+- Checks fire when a speaker pauses after a complete phrase (at most one
+  request every 4.5 seconds, the free-tier rate limit). Someone talking
+  nonstop is checked mid-flow after ~7 seconds.
 - The referee is deliberately conservative: opinions and vague claims are
   ignored. Test it with something concrete and clearly wrong, e.g. "the Great
   Wall of China is visible from the Moon" or "unemployment is 40 percent".

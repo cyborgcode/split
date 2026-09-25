@@ -23,11 +23,35 @@ interface PlacedFinding {
 
 /* Gemini's free tier allows 15 requests/min per model. Spacing requests
    4.5s apart keeps us at ~13/min — under the cap even with network jitter. */
-const ANALYZE_INTERVAL_MS = 5000;
 const MIN_SPACING_MS = 4500;
-const MIN_CHUNK_CHARS = 40;
-const MAX_WAIT_MS = 10000;
-const CONTEXT_CHARS = 1500;
+/* The loop re-evaluates this often, so a check goes out the moment the
+   speaker pauses and the spacing allows — not on a coarse fixed tick. */
+const TICK_MS = 400;
+/* How much earlier conversation rides along so the model can follow the
+   argument (the server accepts up to 8000 chars). */
+const CONTEXT_CHARS = 3000;
+/* Someone talking this long without a single pause gets checked mid-flow. */
+const MONOLOGUE_MS = 7000;
+
+/**
+ * Checks follow the rhythm of the debate: they fire at natural pauses
+ * (finalized utterances), never mid-sentence. While someone keeps talking,
+ * a short fragment waits to grow into a full thought — at the start, with
+ * no context, that means a whole sentence; once the model has heard enough
+ * of the exchange, even a short phrase ("no, it was 1969") is meaningful,
+ * so smaller slices go out and are held for less time.
+ */
+function pacing(heardChars: number): { minChars: number; maxHoldMs: number } {
+  if (heardChars < 150) return { minChars: 50, maxHoldMs: 6000 };
+  if (heardChars < 600) return { minChars: 30, maxHoldMs: 4000 };
+  return { minChars: 12, maxHoldMs: 2500 };
+}
+
+/* A slice ending on one of these is a thought cut off mid-sentence — hold
+   it briefly so the rest of the sentence can arrive. */
+const DANGLING =
+  /\b(and|or|but|so|because|cause|then|the|a|an|of|to|that|which|who|is|are|was|were|be|been|has|have|had|with|for|from|in|on|at|by|than|as|if|like|about|my|your|their|his|her|its|our|not|very|more|most|um|uh)$/i;
+
 const REPEAT_WINDOW_MS = 180000;
 
 const VERDICT_LABEL: Record<string, string> = {
@@ -85,13 +109,14 @@ function ttsText(f: Finding): string {
  * snapped to the end of that word. Falls back to the end of the text.
  */
 function anchorOffset(transcript: string, quote: string, from: number): number {
-  const lower = transcript.toLowerCase();
-  const q = quote.toLowerCase().trim();
+  // Line breaks mark pauses; a quote may span one, so compare as spaces.
+  const lower = transcript.toLowerCase().replace(/\s/g, " ");
+  const q = quote.toLowerCase().replace(/\s+/g, " ").trim();
   let idx = q ? lower.indexOf(q, Math.max(0, from - q.length)) : -1;
-  if (idx < 0 && q.length > 24) idx = lower.indexOf(q.slice(0, 24), from);
+  if (idx < 0 && q.length > 24) idx = lower.indexOf(q.slice(0, 24), Math.max(0, from - 24));
   if (idx < 0) return transcript.length;
   const end = idx + (lower.startsWith(q, idx) ? q.length : 24);
-  const space = transcript.indexOf(" ", end);
+  const space = lower.indexOf(" ", end);
   return space < 0 ? transcript.length : space;
 }
 
@@ -143,7 +168,10 @@ export default function Home() {
   const interimRef = useRef("");
   const analyzedRef = useRef(0);
   const lastChunkRef = useRef("");
+  /** When unchecked speech started waiting; 0 forces it through. */
   const pendingSinceRef = useRef<number | null>(null);
+  /** When the current uninterrupted utterance began (0 = silent). */
+  const interimSinceRef = useRef(0);
   const inFlightRef = useRef(false);
   /** Quote → when it was last flagged; repeats re-alert after 3 minutes. */
   const seenQuotesRef = useRef<Map<string, number>>(new Map());
@@ -162,6 +190,8 @@ export default function Home() {
 
   transcriptRef.current = transcript;
   interimRef.current = interim;
+  if (!interim) interimSinceRef.current = 0;
+  else if (!interimSinceRef.current) interimSinceRef.current = Date.now();
   voiceModeRef.current = voiceMode;
   voiceNameRef.current = voiceName;
   webSearchRef.current = webSearch;
@@ -454,25 +484,39 @@ export default function Home() {
   const lastSentAtRef = useRef(0);
   const analyze = useCallback(async (force = false) => {
     if (inFlightRef.current) return;
-    if (Date.now() < cooldownUntilRef.current) return; // backing off a rate limit
-    // Event-driven ticks can fire often — keep request spacing quota-safe.
-    if (!force && Date.now() - lastSentAtRef.current < MIN_SPACING_MS) return;
+    const now = Date.now();
+    if (now < cooldownUntilRef.current) return; // backing off a rate limit
     const finalText = transcriptRef.current;
-    // Include words still being spoken so continuous talkers get checked
-    // without waiting for a pause. Only finalized text advances the analyzed
-    // pointer — the live tail is re-sent next tick and deduped by quote.
+    const pending = finalText.slice(analyzedRef.current).trim();
     const live = interimRef.current.trim();
-    const combined = live ? `${finalText} ${live}` : finalText;
+    // Words still being spoken are only included when someone has talked
+    // nonstop for a while (or on stop) — otherwise a sentence would be cut
+    // mid-thought. Only finalized text advances the analyzed pointer; a
+    // live tail is re-sent once it finalizes and deduped by quote.
+    const monologue =
+      !!live && !!interimSinceRef.current && now - interimSinceRef.current > MONOLOGUE_MS;
     // Cap what we send — an unbounded chunk would trip the server's length
     // limit forever, since the pointer only advances on success.
-    const chunk = combined.slice(analyzedRef.current).trim().slice(-3500);
+    const chunk = (monologue || force ? `${pending} ${live}` : pending).trim().slice(-3500);
     if (!chunk) return;
     if (chunk === lastChunkRef.current) return; // nothing new since last send
 
-    const pendingSince = pendingSinceRef.current ?? Date.now();
-    pendingSinceRef.current = pendingSince;
-    const waitedLongEnough = Date.now() - pendingSince >= MAX_WAIT_MS;
-    if (chunk.length < MIN_CHUNK_CHARS && !waitedLongEnough) return;
+    if (pendingSinceRef.current === null) pendingSinceRef.current = now;
+    const held = now - pendingSinceRef.current;
+    if (!force && !monologue) {
+      // "no", "okay", "come on" can't be judged alone — they ride along
+      // with the next thought as context.
+      if (chunk.split(/\s+/).length < 3) return;
+      const { minChars, maxHoldMs } = pacing(analyzedRef.current);
+      if (held < maxHoldMs) {
+        if (DANGLING.test(chunk)) return; // trailed off — the rest is coming
+        // Still talking: let a short fragment grow into a full thought.
+        // Gone quiet after a complete phrase: the turn is over — send now.
+        if (live && chunk.length < minChars) return;
+      }
+    }
+    // Keep request spacing quota-safe; the fast tick retries right after.
+    if (!force && now - lastSentAtRef.current < MIN_SPACING_MS) return;
 
     inFlightRef.current = true;
     lastChunkRef.current = chunk;
@@ -482,9 +526,9 @@ export default function Home() {
     const epoch = epochRef.current;
     setAnalyzing(true);
     try {
-      const context = finalText
-        .slice(Math.max(0, sentFrom - CONTEXT_CHARS), sentFrom)
-        .trim();
+      let ctxStart = Math.max(0, sentFrom - CONTEXT_CHARS);
+      if (ctxStart > 0) ctxStart = finalText.indexOf(" ", ctxStart) + 1; // whole words
+      const context = finalText.slice(ctxStart, sentFrom).trim();
       const res = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -565,11 +609,11 @@ export default function Home() {
     }
   }, [interrupt, enrichSource, flash]);
 
-  // Fallback ticker — catches long unfinalized monologues and retries
-  // after a cooldown even if nobody says anything new.
+  // Pacing loop — cheap local checks; a request only goes out when the
+  // speaker reaches a pause (or talks nonstop) and the spacing allows.
   useEffect(() => {
     if (!sessionActive) return;
-    const timer = setInterval(() => void analyze(), ANALYZE_INTERVAL_MS);
+    const timer = setInterval(() => void analyze(), TICK_MS);
     return () => clearInterval(timer);
   }, [sessionActive, analyze]);
 

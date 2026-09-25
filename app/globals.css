@@ -175,6 +175,11 @@ a {
   scroll-behavior: smooth;
 }
 
+/* line breaks in the transcript mark pauses — usually a change of speaker */
+.transcript > p {
+  white-space: pre-line;
+}
+
 .transcript .interim {
   color: var(--accent);
 }
