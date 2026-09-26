@@ -1139,6 +1139,10 @@ export default function Home() {
             <div className="body" lang={noticePopup.lang} dir={noticePopup.lang === "ar" ? "rtl" : undefined}>
               {noticePopup.text}
             </div>
+            {noticePopup.spokenText && (
+              // What the referee is saying, in Latin letters, under the Arabic.
+              <div className="spoken">{noticePopup.spokenText}</div>
+            )}
             {noticePopup.footer && <div className="source">{noticePopup.footer}</div>}
             <div className="skip">Tap anywhere to close</div>
           </div>

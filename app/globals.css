@@ -333,6 +333,14 @@ a {
   text-transform: uppercase;
 }
 
+.v-notice .spoken {
+  margin-top: 10px;
+  font-size: 17px;
+  font-weight: 700;
+  font-style: italic;
+  color: var(--muted);
+}
+
 @keyframes shake {
   0%, 100% { transform: translateX(0) rotate(0); }
   20% { transform: translateX(-8px) rotate(-1.5deg); }
