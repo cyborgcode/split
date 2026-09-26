@@ -138,10 +138,6 @@ interface Notice {
   footer?: string;
   /** "shout" = bigger, shaking popup and a punchier voice. */
   tone: "warn" | "shout";
-  /** Language of the popup text (BCP 47, e.g. "ar"); default English. */
-  lang?: string;
-  /** What the referee says, when it differs from the popup text. */
-  spokenText?: string;
 }
 type SpeakItem = Finding | Notice;
 
@@ -173,13 +169,9 @@ function countAdelSaidThat(text: string): number {
 const ADEL_NOTICE: Notice = {
   type: "notice",
   tag: "Challenge issued",
-  // Tunisian: "Hey Jrouma, challenge me to an MMA round and I'll show you
-  // stars at noon!"
-  text: "يَا جْرُومَة، تْحَدَّانِي فِي رَاوْنْدْ MMA تَوْ نْوَرِّيكْ النّْجُومْ فِي القَايْلَة!",
-  lang: "ar",
-  // Said in the referee's usual English voice (an Arabic voice would be a
-  // different speaker), spelled so it comes out close to Tunisian.
-  spokenText: "Ya Jrouma, t'haddani fi round MMA, taw nwarrik ennjoum fil gayla!",
+  // Tunisian in Latin letters: "Hey Jrouma, challenge me to an MMA round
+  // and I'll show you stars at noon!" — said in the referee's usual voice.
+  text: "Ya Jrouma, t'haddani fi round MMA, taw nwarrik ennjoum fil gayla!",
   tone: "shout",
 };
 
@@ -485,7 +477,7 @@ export default function Home() {
 
     const speechEpoch = speechEpochRef.current;
     void (async () => {
-      const text = isNotice ? (next.spokenText ?? next.text) : ttsText(next);
+      const text = isNotice ? next.text : ttsText(next);
       if (calloutClearTimerRef.current) clearTimeout(calloutClearTimerRef.current);
       calloutTextRef.current = text;
       // The "faaah" alert is a surprise, not a metronome: roughly one
@@ -1136,13 +1128,7 @@ export default function Home() {
             aria-live="assertive"
           >
             <span className="tag">{noticePopup.tag}</span>
-            <div className="body" lang={noticePopup.lang} dir={noticePopup.lang === "ar" ? "rtl" : undefined}>
-              {noticePopup.text}
-            </div>
-            {noticePopup.spokenText && (
-              // What the referee is saying, in Latin letters, under the Arabic.
-              <div className="spoken">{noticePopup.spokenText}</div>
-            )}
+            <div className="body">{noticePopup.text}</div>
             {noticePopup.footer && <div className="source">{noticePopup.footer}</div>}
             <div className="skip">Tap anywhere to close</div>
           </div>
