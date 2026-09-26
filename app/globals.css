@@ -309,6 +309,13 @@ a {
 .v-fallacy {
   border-color: var(--fallacy) !important;
 }
+.v-notice {
+  border-color: var(--misleading) !important;
+}
+.v-notice .tag {
+  color: var(--misleading);
+  background: var(--misleading-bg);
+}
 .v-fallacy .tag {
   color: var(--fallacy);
   background: var(--fallacy-bg);

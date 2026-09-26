@@ -185,6 +185,9 @@ export default function Home() {
   const [browserVoices, setBrowserVoices] = useState<string[]>([]);
   const [webSearch, setWebSearch] = useState(true);
   const [speakingFinding, setSpeakingFinding] = useState<Finding | null>(null);
+  /** A system message (e.g. daily quota) shown as a popup like a callout. */
+  const [noticePopup, setNoticePopup] = useState<string | null>(null);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [viewedId, setViewedId] = useState<number | null>(null);
   const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
   const [model, setModel] = useState("");
@@ -434,7 +437,8 @@ export default function Home() {
     const isNotice = next.type === "notice";
     // Recognition keeps running in parallel — the echo filter scrubs the
     // referee's own voice so the debaters' words are never lost.
-    if (!isNotice) setSpeakingFinding(next);
+    if (isNotice) setNoticePopup(next.text);
+    else setSpeakingFinding(next);
     if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
 
     const speechEpoch = speechEpochRef.current;
@@ -461,6 +465,7 @@ export default function Home() {
       }, 2500);
       speakingRef.current = false;
       setSpeakingFinding(null);
+      if (isNotice) setNoticePopup(null);
       drainSpeakQueue();
     })();
   }, [playAlert, speakWithBrowserTts, chime]);
@@ -469,7 +474,11 @@ export default function Home() {
   const announce = useCallback(
     (text: string) => {
       if (voiceModeRef.current === "off") {
+        // Silent mode: same popup, shown for a few seconds instead of spoken.
         chime();
+        setNoticePopup(text);
+        if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
+        noticeTimerRef.current = setTimeout(() => setNoticePopup(null), 7000);
         return;
       }
       speakQueueRef.current.push({ type: "notice", text });
@@ -891,7 +900,7 @@ export default function Home() {
   const factCount = findings.filter((pf) => pf.finding.type === "fact_check").length;
   const fallacyCount = findings.length - factCount;
 
-  const status = speakingFinding
+  const status = speakingFinding || (noticePopup && speakingRef.current)
     ? { text: "Referee speaking", tone: "alert" }
     : !sessionActive
       ? { text: "Mic off", tone: "idle" }
@@ -1131,6 +1140,24 @@ export default function Home() {
                 Done
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {noticePopup && !overlayFinding && (
+        <div
+          className="interrupt-overlay"
+          onClick={() => {
+            // Tap to skip, like a callout.
+            skipSpeaking();
+            setNoticePopup(null);
+          }}
+        >
+          <div className="interrupt-card v-notice" role="dialog" aria-live="assertive">
+            <span className="tag">Limit reached</span>
+            <div className="body">{noticePopup}</div>
+            <div className="source">Fact-checking resumes when the free quota resets.</div>
+            <div className="skip">Tap anywhere to close</div>
           </div>
         </div>
       )}
