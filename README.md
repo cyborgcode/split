@@ -72,13 +72,8 @@ shown in AI Studio. Override with `GEMINI_MODEL` if you like.
 Open `http://localhost:3000`, allow microphone access, press
 **Start listening**, and start arguing.
 
-> Works in Chrome, Edge, Safari and **Firefox** (desktop or mobile). Chrome,
-> Edge and Safari transcribe live on the device with the Web Speech API.
-> Firefox doesn't have it, so there Split records the mic, cuts clips at
-> natural pauses, and sends them to Gemini, which transcribes **and**
-> fact-checks in the same request — no extra quota. Words appear after each
-> pause rather than live, and anything said while the referee is talking is
-> skipped so it never hears itself.
+> Live speech recognition requires Chrome, Edge, or Safari (desktop or
+> mobile). Firefox doesn't ship the Web Speech API yet.
 
 ## Deploy to Vercel
 
@@ -111,8 +106,8 @@ Open `http://localhost:3000`, allow microphone access, press
   recall is low, set `GEMINI_MODEL=gemini-3.8-flash` — sharper, but its
   free tier is only ~20 requests/day and it queues slowly, so it suits a
   short demo, not daily use.
-- The mic needs HTTPS (or localhost) and mic permission. In Firefox, words
-  show up a moment after each pause — that's normal.
+- Speech recognition needs Chrome, Edge, or Safari over HTTPS (or localhost),
+  with mic permission granted.
 
 ## Notes & limits
 

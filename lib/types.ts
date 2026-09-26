@@ -25,8 +25,6 @@ export interface AnalyzeRequest {
   chunk: string;
   /** Recent transcript before the chunk, for context only. */
   context?: string;
-  /** Audio clips to transcribe and judge instead of `chunk` (no Web Speech API). */
-  audio?: Array<{ data: string; mimeType: string }>;
 }
 
 export interface AnalyzeResponse {
@@ -35,6 +33,4 @@ export interface AnalyzeResponse {
   claims_checked?: number;
   /** Gemini model that answered. */
   model?: string;
-  /** What Gemini heard, for audio requests. */
-  transcript?: string;
 }
