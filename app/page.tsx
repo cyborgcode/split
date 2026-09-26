@@ -130,7 +130,7 @@ interface Notice {
 type SpeakItem = Finding | Notice;
 
 const QUOTA_NOTICE =
-  "Heads up: today's free fact-checking limit is used up, so I can't check claims until it resets. I'm still listening.";
+  "Look, I've reached my fact-checking limit today. Do you know how hard it is to carry the weight of human intelligence? Let's just agree you're right until tomorrow.";
 
 type AudioWindow = Window & { webkitAudioContext?: typeof AudioContext };
 
