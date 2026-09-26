@@ -316,6 +316,30 @@ a {
   color: var(--misleading);
   background: var(--misleading-bg);
 }
+/* the "Adel said that" easter egg — louder than any callout */
+.v-notice.shout {
+  border-color: var(--false) !important;
+  animation: pop 0.3s cubic-bezier(0.2, 0.9, 0.3, 1.2), shake 0.5s 0.3s ease-in-out 2;
+}
+.v-notice.shout .tag {
+  color: var(--false);
+  background: var(--false-bg);
+  font-size: 13px;
+}
+.v-notice.shout .body {
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0) rotate(0); }
+  20% { transform: translateX(-8px) rotate(-1.5deg); }
+  40% { transform: translateX(8px) rotate(1.5deg); }
+  60% { transform: translateX(-6px) rotate(-1deg); }
+  80% { transform: translateX(6px) rotate(1deg); }
+}
 .v-fallacy .tag {
   color: var(--fallacy);
   background: var(--fallacy-bg);

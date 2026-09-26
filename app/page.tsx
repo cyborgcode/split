@@ -130,15 +130,34 @@ function simulateQuota(): boolean {
   return new URLSearchParams(window.location.search).get("simulate") === "quota";
 }
 
-/** A spoken system message (not a callout) — no card, softer sound. */
+/** A spoken system message (not a callout) — own popup, soft chime. */
 interface Notice {
   type: "notice";
   text: string;
+  tag: string;
+  footer?: string;
+  /** "shout" = bigger, shaking popup and a punchier voice. */
+  tone: "warn" | "shout";
 }
 type SpeakItem = Finding | Notice;
 
-const QUOTA_NOTICE =
-  "Look, I've reached my fact-checking limit today. Do you know how hard it is to carry the weight of human intelligence? Let's just agree you're right until tomorrow.";
+const QUOTA_NOTICE: Notice = {
+  type: "notice",
+  tag: "Limit reached",
+  text: "Look, I've reached my fact-checking limit today. Do you know how hard it is to carry the weight of human intelligence? Let's just agree you're right until tomorrow.",
+  footer: "Fact-checking resumes when the free quota resets.",
+  tone: "warn",
+};
+
+/* Easter egg: whenever someone says "Adel said that". Speech recognition
+   often spells the name "Adele", "Adell" or "a del". */
+const ADEL_SAID_THAT = /\b(?:adel+e?|a del+)\s+said\s+that\b/gi;
+const ADEL_NOTICE: Notice = {
+  type: "notice",
+  tag: "Challenge issued",
+  text: "Hey Jrouma, challenge me to an MMA round, and I will show you stars at noon!",
+  tone: "shout",
+};
 
 type AudioWindow = Window & { webkitAudioContext?: typeof AudioContext };
 
@@ -177,7 +196,9 @@ export default function Home() {
   const [webSearch, setWebSearch] = useState(true);
   const [speakingFinding, setSpeakingFinding] = useState<Finding | null>(null);
   /** A system message (e.g. daily quota) shown as a popup like a callout. */
-  const [noticePopup, setNoticePopup] = useState<string | null>(null);
+  const [noticePopup, setNoticePopup] = useState<Notice | null>(null);
+  /** How many "Adel said that" were already answered in this transcript. */
+  const adelAnsweredRef = useRef(0);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [viewedId, setViewedId] = useState<number | null>(null);
   const [aiConfigured, setAiConfigured] = useState<boolean | null>(null);
@@ -378,12 +399,14 @@ export default function Home() {
   }, [buzzer, getAudioCtx]);
 
   /* ── Spoken interruptions — browser speech synthesis ────────────────── */
-  const speakWithBrowserTts = useCallback((text: string): Promise<void> => {
+  const speakWithBrowserTts = useCallback(
+    (text: string, voice?: { rate?: number; pitch?: number }): Promise<void> => {
     return new Promise((resolve) => {
       if (!("speechSynthesis" in window)) return resolve();
       const synth = window.speechSynthesis;
       const utter = new SpeechSynthesisUtterance(text);
-      utter.rate = 1.15;
+      utter.rate = voice?.rate ?? 1.15;
+      if (voice?.pitch) utter.pitch = voice.pitch;
       utter.volume = 1;
       utter.lang = "en-US";
       const picked = voiceNameRef.current
@@ -419,7 +442,9 @@ export default function Home() {
         synth.speak(utter);
       }
     });
-  }, []);
+  },
+  []
+  );
 
   const calloutClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const drainSpeakQueue = useCallback(() => {
@@ -430,7 +455,7 @@ export default function Home() {
     const isNotice = next.type === "notice";
     // Recognition keeps running in parallel — the echo filter scrubs the
     // referee's own voice so the debaters' words are never lost.
-    if (isNotice) setNoticePopup(next.text);
+    if (isNotice) setNoticePopup(next);
     else setSpeakingFinding(next);
     if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
 
@@ -457,7 +482,10 @@ export default function Home() {
         alertDone = Promise.resolve();
       }
       await new Promise((r) => setTimeout(r, bigAlert ? 900 : 450));
-      if (speechEpoch === speechEpochRef.current) await speakWithBrowserTts(text);
+      if (speechEpoch === speechEpochRef.current) {
+        const shout = isNotice && next.tone === "shout";
+        await speakWithBrowserTts(text, shout ? { rate: 1.05, pitch: 1.25 } : undefined);
+      }
       await alertDone.catch(() => {});
       // recognition finals lag behind the audio — keep filtering briefly
       calloutClearTimerRef.current = setTimeout(() => {
@@ -472,16 +500,16 @@ export default function Home() {
 
   /** Say a system message once, after any callout already in progress. */
   const announce = useCallback(
-    (text: string) => {
+    (notice: Notice) => {
       if (voiceModeRef.current === "off") {
         // Silent mode: same popup, shown for a few seconds instead of spoken.
         chime();
-        setNoticePopup(text);
+        setNoticePopup(notice);
         if (noticeTimerRef.current) clearTimeout(noticeTimerRef.current);
         noticeTimerRef.current = setTimeout(() => setNoticePopup(null), 7000);
         return;
       }
-      speakQueueRef.current.push({ type: "notice", text });
+      speakQueueRef.current.push(notice);
       drainSpeakQueue();
     },
     [drainSpeakQueue, chime]
@@ -696,6 +724,15 @@ export default function Home() {
     void analyze();
   }, [transcript, sessionActive, analyze]);
 
+  // Easter egg: answer every new "Adel said that" — detected on-device from
+  // finalized speech, so it costs no Gemini quota.
+  useEffect(() => {
+    if (!sessionActive) return;
+    const said = transcript.match(ADEL_SAID_THAT)?.length ?? 0;
+    if (said > adelAnsweredRef.current) announce(ADEL_NOTICE);
+    adelAnsweredRef.current = said;
+  }, [transcript, sessionActive, announce]);
+
   /* ── Session controls ───────────────────────────────────────────────── */
   const handleStart = useCallback(() => {
     setApiError(null);
@@ -749,6 +786,7 @@ export default function Home() {
     lastChunkRef.current = "";
     pendingSinceRef.current = null;
     seenQuotesRef.current.clear();
+    adelAnsweredRef.current = 0;
   }, [reset]);
 
   // Keep the newest words in view — unless the reader scrolled up.
@@ -1068,10 +1106,14 @@ export default function Home() {
             setNoticePopup(null);
           }}
         >
-          <div className="interrupt-card v-notice" role="dialog" aria-live="assertive">
-            <span className="tag">Limit reached</span>
-            <div className="body">{noticePopup}</div>
-            <div className="source">Fact-checking resumes when the free quota resets.</div>
+          <div
+            className={`interrupt-card v-notice ${noticePopup.tone === "shout" ? "shout" : ""}`}
+            role="dialog"
+            aria-live="assertive"
+          >
+            <span className="tag">{noticePopup.tag}</span>
+            <div className="body">{noticePopup.text}</div>
+            {noticePopup.footer && <div className="source">{noticePopup.footer}</div>}
             <div className="skip">Tap anywhere to close</div>
           </div>
         </div>
