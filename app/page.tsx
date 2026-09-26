@@ -122,6 +122,16 @@ function anchorOffset(transcript: string, quote: string, from: number): number {
 
 type VoiceMode = "off" | "browser";
 
+/** A spoken system message (not a callout) — no card, softer sound. */
+interface Notice {
+  type: "notice";
+  text: string;
+}
+type SpeakItem = Finding | Notice;
+
+const QUOTA_NOTICE =
+  "Heads up: today's free fact-checking limit is used up, so I can't check claims until it resets. I'm still listening.";
+
 type AudioWindow = Window & { webkitAudioContext?: typeof AudioContext };
 
 export default function Home() {
@@ -181,7 +191,9 @@ export default function Home() {
   const voiceModeRef = useRef<VoiceMode>(voiceMode);
   const voiceNameRef = useRef(voiceName);
   const webSearchRef = useRef(webSearch);
-  const speakQueueRef = useRef<Finding[]>([]);
+  const speakQueueRef = useRef<SpeakItem[]>([]);
+  /** The daily-quota announcement was already spoken for this outage. */
+  const quotaAnnouncedRef = useRef(false);
   const speakingRef = useRef(false);
   /** Bumped on stop so a callout still waiting on its alert stays silent. */
   const speechEpochRef = useRef(0);
@@ -402,20 +414,28 @@ export default function Home() {
     const next = speakQueueRef.current.shift();
     if (!next) return;
     speakingRef.current = true;
+    const isNotice = next.type === "notice";
     // Recognition keeps running in parallel — the echo filter scrubs the
     // referee's own voice so the debaters' words are never lost.
-    setSpeakingFinding(next);
+    if (!isNotice) setSpeakingFinding(next);
     if (navigator.vibrate) navigator.vibrate([120, 60, 120]);
 
     const speechEpoch = speechEpochRef.current;
     void (async () => {
-      const text = ttsText(next);
+      const text = isNotice ? next.text : ttsText(next);
       if (calloutClearTimerRef.current) clearTimeout(calloutClearTimerRef.current);
       calloutTextRef.current = text;
       // The alert grabs the room's attention; the voice cuts in over its
-      // tail instead of waiting for it to finish.
-      const alertDone = playAlert();
-      await new Promise((r) => setTimeout(r, 900));
+      // tail instead of waiting for it to finish. Notices get a soft chime
+      // — they aren't calling anyone out.
+      let alertDone: Promise<void>;
+      if (isNotice) {
+        chime();
+        alertDone = Promise.resolve();
+      } else {
+        alertDone = playAlert();
+      }
+      await new Promise((r) => setTimeout(r, isNotice ? 500 : 900));
       if (speechEpoch === speechEpochRef.current) await speakWithBrowserTts(text);
       await alertDone.catch(() => {});
       // recognition finals lag behind the audio — keep filtering briefly
@@ -426,7 +446,20 @@ export default function Home() {
       setSpeakingFinding(null);
       drainSpeakQueue();
     })();
-  }, [playAlert, speakWithBrowserTts]);
+  }, [playAlert, speakWithBrowserTts, chime]);
+
+  /** Say a system message once, after any callout already in progress. */
+  const announce = useCallback(
+    (text: string) => {
+      if (voiceModeRef.current === "off") {
+        chime();
+        return;
+      }
+      speakQueueRef.current.push({ type: "notice", text });
+      drainSpeakQueue();
+    },
+    [drainSpeakQueue, chime]
+  );
 
   const interrupt = useCallback(
     (fresh: Finding[]) => {
@@ -542,6 +575,12 @@ export default function Home() {
         if (res.status === 429 && data?.daily_quota) {
           // Every model's daily cap is spent — poll gently until it resets.
           setQuotaExhausted(true);
+          // The banner is easy to miss with the phone lying between two
+          // debaters — say it out loud, once per outage.
+          if (!quotaAnnouncedRef.current) {
+            quotaAnnouncedRef.current = true;
+            announce(QUOTA_NOTICE);
+          }
           cooldownUntilRef.current = Date.now() + 60000;
           return;
         }
@@ -557,6 +596,7 @@ export default function Home() {
       setApiError(null);
       setRateLimited(false);
       setQuotaExhausted(false);
+      quotaAnnouncedRef.current = false;
       analyzedRef.current = sentUpTo;
       pendingSinceRef.current = null;
 
@@ -607,7 +647,7 @@ export default function Home() {
         setAnalyzing(false);
       }
     }
-  }, [interrupt, enrichSource, flash]);
+  }, [interrupt, enrichSource, flash, announce]);
 
   // Pacing loop — cheap local checks; a request only goes out when the
   // speaker reaches a pause (or talks nonstop) and the spacing allows.
