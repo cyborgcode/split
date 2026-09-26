@@ -161,7 +161,7 @@ const ADEL_NOTICE: Notice = {
   tag: "Challenge issued",
   // Tunisian: "Hey Jrouma, challenge me to an MMA round and I'll show you
   // stars at noon!"
-  text: "يا جرومة، تحدّاني في راوند MMA ونورّيك النجوم في القايلة!",
+  text: "يا جرومة، تحدّاني في راوند MMA تو نورّيك النجوم في القايلة!",
   lang: "ar",
   fallbackText: "Hey Jrouma, challenge me to an MMA round, and I will show you stars at noon!",
   tone: "shout",
