@@ -54,6 +54,10 @@ const DANGLING =
   /\b(and|or|but|so|because|cause|then|the|a|an|of|to|that|which|who|is|are|was|were|be|been|has|have|had|with|for|from|in|on|at|by|than|as|if|like|about|my|your|their|his|her|its|our|not|very|more|most|um|uh)$/i;
 
 const REPEAT_WINDOW_MS = 180000;
+/** Chance a callout gets the "faaah" alert instead of a chime. */
+const BIG_ALERT_CHANCE = 0.35;
+/** ...but never more than this many callouts in a row without it. */
+const BIG_ALERT_MAX_GAP = 4;
 
 const VERDICT_LABEL: Record<string, string> = {
   false: "False",
@@ -212,6 +216,8 @@ export default function Home() {
   const voiceNameRef = useRef(voiceName);
   const webSearchRef = useRef(webSearch);
   const speakQueueRef = useRef<SpeakItem[]>([]);
+  /** Callouts since the last "faaah" — starts high so the first can have it. */
+  const calloutsSinceBigAlertRef = useRef(1);
   /** The daily-quota announcement was already spoken for this outage. */
   const quotaAnnouncedRef = useRef(false);
   const speakingRef = useRef(false);
@@ -446,17 +452,24 @@ export default function Home() {
       const text = isNotice ? next.text : ttsText(next);
       if (calloutClearTimerRef.current) clearTimeout(calloutClearTimerRef.current);
       calloutTextRef.current = text;
-      // The alert grabs the room's attention; the voice cuts in over its
-      // tail instead of waiting for it to finish. Notices get a soft chime
-      // — they aren't calling anyone out.
+      // The "faaah" alert is a surprise, not a metronome: roughly one
+      // callout in three, never twice in a row, and never missing for more
+      // than a few callouts. The rest get a soft chime; notices always do.
+      // The voice cuts in over the alert's tail instead of waiting for it.
+      let bigAlert = false;
+      if (!isNotice) {
+        const since = calloutsSinceBigAlertRef.current;
+        bigAlert = since > 0 && (since >= BIG_ALERT_MAX_GAP || Math.random() < BIG_ALERT_CHANCE);
+        calloutsSinceBigAlertRef.current = bigAlert ? 0 : since + 1;
+      }
       let alertDone: Promise<void>;
-      if (isNotice) {
+      if (bigAlert) {
+        alertDone = playAlert();
+      } else {
         chime();
         alertDone = Promise.resolve();
-      } else {
-        alertDone = playAlert();
       }
-      await new Promise((r) => setTimeout(r, isNotice ? 500 : 900));
+      await new Promise((r) => setTimeout(r, bigAlert ? 900 : 450));
       if (speechEpoch === speechEpochRef.current) await speakWithBrowserTts(text);
       await alertDone.catch(() => {});
       // recognition finals lag behind the audio — keep filtering briefly
