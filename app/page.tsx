@@ -138,10 +138,10 @@ interface Notice {
   footer?: string;
   /** "shout" = bigger, shaking popup and a punchier voice. */
   tone: "warn" | "shout";
-  /** Speak and show in this language (BCP 47, e.g. "ar"); default English. */
+  /** Language of the popup text (BCP 47, e.g. "ar"); default English. */
   lang?: string;
-  /** Spoken instead when the device has no voice for `lang`. */
-  fallbackText?: string;
+  /** What the referee says, when it differs from the popup text. */
+  spokenText?: string;
 }
 type SpeakItem = Finding | Notice;
 
@@ -177,7 +177,9 @@ const ADEL_NOTICE: Notice = {
   // stars at noon!"
   text: "يَا جْرُومَة، تْحَدَّانِي فِي رَاوْنْدْ MMA تَوْ نْوَرِّيكْ النّْجُومْ فِي القَايْلَة!",
   lang: "ar",
-  fallbackText: "Hey Jrouma, challenge me to an MMA round, and I will show you stars at noon!",
+  // Said in the referee's usual English voice (an Arabic voice would be a
+  // different speaker), spelled so it comes out close to Tunisian.
+  spokenText: "Ya Jrouma, t'haddani fi round MMA, taw nwarrik ennjoum fil gayla!",
   tone: "shout",
 };
 
@@ -422,7 +424,7 @@ export default function Home() {
 
   /* ── Spoken interruptions — browser speech synthesis ────────────────── */
   const speakWithBrowserTts = useCallback(
-    (text: string, voice?: { rate?: number; pitch?: number; lang?: string }): Promise<void> => {
+    (text: string, voice?: { rate?: number; pitch?: number }): Promise<void> => {
     return new Promise((resolve) => {
       if (!("speechSynthesis" in window)) return resolve();
       const synth = window.speechSynthesis;
@@ -430,19 +432,12 @@ export default function Home() {
       utter.rate = voice?.rate ?? 1.15;
       if (voice?.pitch) utter.pitch = voice.pitch;
       utter.volume = 1;
-      if (voice?.lang) {
-        // Another language: use a voice for it, not the English pick.
-        const native = synth.getVoices().find((v) => v.lang.toLowerCase().startsWith(voice.lang!));
-        utter.lang = native?.lang ?? voice.lang;
-        if (native) utter.voice = native;
-      } else {
-        utter.lang = "en-US";
-        const picked = voiceNameRef.current
-          ? synth.getVoices().find((v) => v.name === voiceNameRef.current)
-          : null;
-        const chosen = picked ?? ttsVoiceRef.current;
-        if (chosen) utter.voice = chosen;
-      }
+      utter.lang = "en-US";
+      const picked = voiceNameRef.current
+        ? synth.getVoices().find((v) => v.name === voiceNameRef.current)
+        : null;
+      const chosen = picked ?? ttsVoiceRef.current;
+      if (chosen) utter.voice = chosen;
 
       // Chrome silently pauses long utterances; nudge it while speaking.
       const keepAlive = setInterval(() => synth.resume(), 4000);
@@ -490,7 +485,7 @@ export default function Home() {
 
     const speechEpoch = speechEpochRef.current;
     void (async () => {
-      const text = isNotice ? next.text : ttsText(next);
+      const text = isNotice ? (next.spokenText ?? next.text) : ttsText(next);
       if (calloutClearTimerRef.current) clearTimeout(calloutClearTimerRef.current);
       calloutTextRef.current = text;
       // The "faaah" alert is a surprise, not a metronome: roughly one
@@ -513,20 +508,7 @@ export default function Home() {
       await new Promise((r) => setTimeout(r, bigAlert ? 900 : 450));
       if (speechEpoch === speechEpochRef.current) {
         const shout = isNotice && next.tone === "shout";
-        const style = shout ? { rate: 1.05, pitch: 1.25 } : {};
-        // No voice for the notice's language on this device → say the
-        // fallback in English rather than mangling (or skipping) it.
-        const lang = isNotice ? next.lang : undefined;
-        const hasVoice =
-          !lang ||
-          window.speechSynthesis
-            ?.getVoices()
-            .some((v) => v.lang.toLowerCase().startsWith(lang));
-        if (lang && hasVoice) await speakWithBrowserTts(text, { ...style, lang });
-        else if (lang && isNotice && next.fallbackText) {
-          calloutTextRef.current = next.fallbackText;
-          await speakWithBrowserTts(next.fallbackText, style);
-        } else await speakWithBrowserTts(text, style);
+        await speakWithBrowserTts(text, shout ? { rate: 1.05, pitch: 1.25 } : undefined);
       }
       await alertDone.catch(() => {});
       // recognition finals lag behind the audio — keep filtering briefly
