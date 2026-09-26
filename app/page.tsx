@@ -864,7 +864,7 @@ export default function Home() {
       </div>
 
       <div className="dock">
-        <WaveBar active={sessionActive} />
+        <WaveBar active={sessionActive} talking={!!interim} />
         <div className="controls">
           <div className="controls-side left">
             <button

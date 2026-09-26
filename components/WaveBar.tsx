@@ -6,11 +6,34 @@ const BAR_COUNT = 36;
 const TALK_THRESHOLD = 0.045; // RMS level above which the bar "illuminates"
 
 /**
- * Full-width audio wave that lights up while someone is talking.
- * Opens its own mic stream (independent of speech recognition) and renders
- * live frequency bars to a canvas.
+ * Phones (and Safari) can't share the mic between speech recognition and a
+ * second audio stream: opening one kills the other, so recognition keeps
+ * restarting. There the bars are driven by recognition activity instead.
  */
-export default function WaveBar({ active }: { active: boolean }) {
+function canOpenSecondMicStream(): boolean {
+  const ua = navigator.userAgent;
+  const mobile =
+    /Android|iPhone|iPad|iPod|Mobile/i.test(ua) ||
+    (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1); // iPadOS
+  const safari = /Safari/.test(ua) && !/Chrome|Chromium|Edg|OPR/.test(ua);
+  return !mobile && !safari;
+}
+
+/**
+ * Full-width audio wave that lights up while someone is talking. On desktop
+ * Chromium it renders live frequency bars from its own mic stream; elsewhere
+ * it animates whenever speech recognition is hearing words (`talking`).
+ */
+export default function WaveBar({
+  active,
+  talking: hearing = false,
+}: {
+  active: boolean;
+  talking?: boolean;
+}) {
+  const hearingRef = useRef(hearing);
+  hearingRef.current = hearing;
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -51,7 +74,9 @@ export default function WaveBar({ active }: { active: boolean }) {
         }
         rms = Math.sqrt(sum / time.length);
       }
-      const talking = rms > TALK_THRESHOLD;
+      const synthetic = active && !analyser;
+      const talking = synthetic ? hearingRef.current : rms > TALK_THRESHOLD;
+      const t = performance.now() / 1000;
 
       const gap = 3;
       const barW = (w - gap * (BAR_COUNT - 1)) / BAR_COUNT;
@@ -62,6 +87,12 @@ export default function WaveBar({ active }: { active: boolean }) {
           // sample the lower ~2/3 of the spectrum, where speech lives
           const idx = Math.floor((i / BAR_COUNT) * bins.length * 0.66);
           level = bins[idx] / 255;
+        } else if (synthetic) {
+          // no mic access of our own — a speech-like ripple while words arrive
+          const wave =
+            Math.abs(Math.sin(t * 5.1 + i * 0.55)) * 0.6 +
+            Math.abs(Math.sin(t * 8.3 - i * 0.9)) * 0.4;
+          level = talking ? 0.2 + wave * 0.6 : 0.04 + Math.abs(Math.sin(t * 1.5 + i * 0.3)) * 0.04;
         }
         const barH = Math.max(3, level * (h - 6));
         ctx2d.fillStyle = talking
@@ -70,13 +101,14 @@ export default function WaveBar({ active }: { active: boolean }) {
         const x = i * (barW + gap);
         const r = Math.min(barW / 2, 3);
         ctx2d.beginPath();
-        ctx2d.roundRect(x, mid - barH / 2, barW, barH, r);
+        if (ctx2d.roundRect) ctx2d.roundRect(x, mid - barH / 2, barW, barH, r);
+        else ctx2d.rect(x, mid - barH / 2, barW, barH); // iOS < 16
         ctx2d.fill();
       }
       raf = requestAnimationFrame(draw);
     };
 
-    if (active) {
+    if (active && canOpenSecondMicStream() && navigator.mediaDevices) {
       navigator.mediaDevices
         .getUserMedia({ audio: true })
         .then((s) => {
@@ -97,6 +129,8 @@ export default function WaveBar({ active }: { active: boolean }) {
         .catch(() => {
           /* mic denied — the speech hook surfaces the error */
         });
+      raf = requestAnimationFrame(draw);
+    } else if (active) {
       raf = requestAnimationFrame(draw);
     } else {
       // one static frame of dim idle bars

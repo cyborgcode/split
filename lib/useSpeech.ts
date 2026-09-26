@@ -68,6 +68,7 @@ export function useSpeech(
   const [error, setError] = useState<string | null>(null);
 
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const beginRef = useRef<(() => void) | null>(null);
   const shouldListenRef = useRef(false);
   const committedRef = useRef<Map<number, { raw: string }>>(new Map());
   /** Results below this index belong to text the user already cleared. */
@@ -77,6 +78,13 @@ export function useSpeech(
   /** An interim utterance is in progress. */
   const speakingRef = useRef(false);
   const breakPendingRef = useRef(false);
+  /** Latest not-yet-final words (already filtered). */
+  const pendingInterimRef = useRef("");
+  const sessionStartRef = useRef(0);
+  const sessionHeardRef = useRef(false);
+  /** Recognition sessions in a row that died before hearing anything. */
+  const quickFailsRef = useRef(0);
+  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const Ctor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
@@ -94,6 +102,21 @@ export function useSpeech(
        every index — not just from resultIndex — also absorbs Android
        Chrome, which re-delivers earlier finals and sometimes repeats the
        previous final as the prefix of the next one. */
+    const commit = (text: string, now: number) => {
+      const brk = breakPendingRef.current;
+      breakPendingRef.current = false;
+      lastFinalAtRef.current = now;
+      setTranscript((prev) => prev + (brk && prev ? "\n" : "") + text);
+      setError(null); // hearing speech again — a past hiccup is over
+    };
+
+    const begin = () => {
+      sessionStartRef.current = Date.now();
+      sessionHeardRef.current = false;
+      rec.start();
+    };
+    beginRef.current = begin;
+
     rec.onresult = (event) => {
       const committed = committedRef.current;
       const now = Date.now();
@@ -127,13 +150,12 @@ export function useSpeech(
         if (last && now - last > PAUSE_BREAK_MS) breakPendingRef.current = true;
       }
       speakingRef.current = !!interimText;
-      if (finalText) {
-        const brk = breakPendingRef.current;
-        breakPendingRef.current = false;
-        lastFinalAtRef.current = now;
-        setTranscript((prev) => prev + (brk && prev ? "\n" : "") + finalText);
-        setError(null); // hearing speech again — a past hiccup is over
+      if (finalText) commit(finalText, now);
+      if (finalText || interimText) {
+        sessionHeardRef.current = true;
+        quickFailsRef.current = 0;
       }
+      pendingInterimRef.current = interimText;
       setInterim(interimText);
       lastLengthRef.current = event.results.length;
     };
@@ -150,27 +172,49 @@ export function useSpeech(
 
     // Chrome stops recognition after silence — restart while a session is active.
     rec.onend = () => {
+      // iOS Safari often ends a session without ever marking its words
+      // final — keep them instead of wiping them with the next session.
+      const leftover = pendingInterimRef.current.trim();
+      pendingInterimRef.current = "";
+      if (leftover) commit(leftover + " ", Date.now());
       // A new recognition session numbers its results from 0 again.
       committedRef.current = new Map();
       firstIndexRef.current = 0;
       lastLengthRef.current = 0;
       speakingRef.current = false;
       setInterim("");
-      if (shouldListenRef.current) {
+      if (!shouldListenRef.current) {
+        setListening(false);
+        return;
+      }
+      // Restart right away after a normal session. If sessions keep dying
+      // instantly (mic busy, audio session switching on iPhone), back off
+      // instead of thrashing the mic on and off.
+      const died = !sessionHeardRef.current && Date.now() - sessionStartRef.current < 2000;
+      quickFailsRef.current = died ? quickFailsRef.current + 1 : 0;
+      if (quickFailsRef.current > 8) {
+        shouldListenRef.current = false;
+        setListening(false);
+        setError("The microphone keeps stopping. Close other apps using the mic and tap the mic again.");
+        return;
+      }
+      const delay = died ? Math.min(250 * 2 ** quickFailsRef.current, 4000) : 0;
+      if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = setTimeout(() => {
+        if (!shouldListenRef.current) return;
         try {
-          rec.start();
+          begin();
         } catch {
           shouldListenRef.current = false;
           setListening(false);
         }
-      } else {
-        setListening(false);
-      }
+      }, delay);
     };
 
     recognitionRef.current = rec;
     return () => {
       shouldListenRef.current = false;
+      if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
       rec.onresult = null;
       rec.onerror = null;
       rec.onend = null;
@@ -187,8 +231,9 @@ export function useSpeech(
     if (!rec || shouldListenRef.current) return;
     setError(null);
     shouldListenRef.current = true;
+    quickFailsRef.current = 0;
     try {
-      rec.start();
+      beginRef.current?.();
       setListening(true);
     } catch {
       /* start() throws if already running — treat as listening */
@@ -198,6 +243,7 @@ export function useSpeech(
 
   const stop = useCallback(() => {
     shouldListenRef.current = false;
+    if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
     setListening(false);
     setInterim("");
     try {
@@ -210,6 +256,7 @@ export function useSpeech(
   const reset = useCallback(() => {
     // The live session keeps its old results — skip past them.
     firstIndexRef.current = lastLengthRef.current;
+    pendingInterimRef.current = "";
     lastFinalAtRef.current = 0;
     breakPendingRef.current = false;
     setTranscript("");
