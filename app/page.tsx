@@ -122,6 +122,10 @@ function anchorOffset(transcript: string, quote: string, from: number): number {
 
 type VoiceMode = "off" | "browser";
 
+function simulateQuota(): boolean {
+  return new URLSearchParams(window.location.search).get("simulate") === "quota";
+}
+
 /** A spoken system message (not a callout) — no card, softer sound. */
 interface Notice {
   type: "notice";
@@ -562,12 +566,18 @@ export default function Home() {
       let ctxStart = Math.max(0, sentFrom - CONTEXT_CHARS);
       if (ctxStart > 0) ctxStart = finalText.indexOf(" ", ctxStart) + 1; // whole words
       const context = finalText.slice(ctxStart, sentFrom).trim();
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chunk, context }),
-        signal: AbortSignal.timeout(28000),
-      });
+      // ?simulate=quota rehearses the out-of-quota path (banner, status,
+      // spoken announcement) without spending a single Gemini request.
+      const res = simulateQuota()
+        ? new Response(JSON.stringify({ error: "Simulated daily quota", daily_quota: true }), {
+            status: 429,
+          })
+        : await fetch("/api/analyze", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chunk, context }),
+            signal: AbortSignal.timeout(28000),
+          });
       if (epoch !== epochRef.current) return; // cleared while in flight
       if (!res.ok) {
         lastChunkRef.current = ""; // failed — let the next tick retry this chunk
