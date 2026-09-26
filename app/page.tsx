@@ -138,6 +138,10 @@ interface Notice {
   footer?: string;
   /** "shout" = bigger, shaking popup and a punchier voice. */
   tone: "warn" | "shout";
+  /** Speak and show in this language (BCP 47, e.g. "ar"); default English. */
+  lang?: string;
+  /** Spoken instead when the device has no voice for `lang`. */
+  fallbackText?: string;
 }
 type SpeakItem = Finding | Notice;
 
@@ -155,7 +159,11 @@ const ADEL_SAID_THAT = /\b(?:adel+e?|a del+)\s+said\s+that\b/gi;
 const ADEL_NOTICE: Notice = {
   type: "notice",
   tag: "Challenge issued",
-  text: "Hey Jrouma, challenge me to an MMA round, and I will show you stars at noon!",
+  // Tunisian: "Hey Jrouma, challenge me to an MMA round and I'll show you
+  // stars at noon!"
+  text: "يا جرومة، تحدّاني في راوند MMA ونورّيك النجوم في القايلة!",
+  lang: "ar",
+  fallbackText: "Hey Jrouma, challenge me to an MMA round, and I will show you stars at noon!",
   tone: "shout",
 };
 
@@ -400,7 +408,7 @@ export default function Home() {
 
   /* ── Spoken interruptions — browser speech synthesis ────────────────── */
   const speakWithBrowserTts = useCallback(
-    (text: string, voice?: { rate?: number; pitch?: number }): Promise<void> => {
+    (text: string, voice?: { rate?: number; pitch?: number; lang?: string }): Promise<void> => {
     return new Promise((resolve) => {
       if (!("speechSynthesis" in window)) return resolve();
       const synth = window.speechSynthesis;
@@ -408,12 +416,19 @@ export default function Home() {
       utter.rate = voice?.rate ?? 1.15;
       if (voice?.pitch) utter.pitch = voice.pitch;
       utter.volume = 1;
-      utter.lang = "en-US";
-      const picked = voiceNameRef.current
-        ? synth.getVoices().find((v) => v.name === voiceNameRef.current)
-        : null;
-      const chosen = picked ?? ttsVoiceRef.current;
-      if (chosen) utter.voice = chosen;
+      if (voice?.lang) {
+        // Another language: use a voice for it, not the English pick.
+        const native = synth.getVoices().find((v) => v.lang.toLowerCase().startsWith(voice.lang!));
+        utter.lang = native?.lang ?? voice.lang;
+        if (native) utter.voice = native;
+      } else {
+        utter.lang = "en-US";
+        const picked = voiceNameRef.current
+          ? synth.getVoices().find((v) => v.name === voiceNameRef.current)
+          : null;
+        const chosen = picked ?? ttsVoiceRef.current;
+        if (chosen) utter.voice = chosen;
+      }
 
       // Chrome silently pauses long utterances; nudge it while speaking.
       const keepAlive = setInterval(() => synth.resume(), 4000);
@@ -484,7 +499,20 @@ export default function Home() {
       await new Promise((r) => setTimeout(r, bigAlert ? 900 : 450));
       if (speechEpoch === speechEpochRef.current) {
         const shout = isNotice && next.tone === "shout";
-        await speakWithBrowserTts(text, shout ? { rate: 1.05, pitch: 1.25 } : undefined);
+        const style = shout ? { rate: 1.05, pitch: 1.25 } : {};
+        // No voice for the notice's language on this device → say the
+        // fallback in English rather than mangling (or skipping) it.
+        const lang = isNotice ? next.lang : undefined;
+        const hasVoice =
+          !lang ||
+          window.speechSynthesis
+            ?.getVoices()
+            .some((v) => v.lang.toLowerCase().startsWith(lang));
+        if (lang && hasVoice) await speakWithBrowserTts(text, { ...style, lang });
+        else if (lang && isNotice && next.fallbackText) {
+          calloutTextRef.current = next.fallbackText;
+          await speakWithBrowserTts(next.fallbackText, style);
+        } else await speakWithBrowserTts(text, style);
       }
       await alertDone.catch(() => {});
       // recognition finals lag behind the audio — keep filtering briefly
@@ -1112,7 +1140,9 @@ export default function Home() {
             aria-live="assertive"
           >
             <span className="tag">{noticePopup.tag}</span>
-            <div className="body">{noticePopup.text}</div>
+            <div className="body" lang={noticePopup.lang} dir={noticePopup.lang === "ar" ? "rtl" : undefined}>
+              {noticePopup.text}
+            </div>
             {noticePopup.footer && <div className="source">{noticePopup.footer}</div>}
             <div className="skip">Tap anywhere to close</div>
           </div>
