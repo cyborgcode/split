@@ -169,9 +169,7 @@ function countAdelSaidThat(text: string): number {
 const ADEL_NOTICE: Notice = {
   type: "notice",
   tag: "Challenge issued",
-  // Tunisian in Latin letters: "Hey Jrouma, challenge me to an MMA round
-  // and I'll show you stars at noon!" — said in the referee's usual voice.
-  text: "Ya Jrouma, t'haddani fi round MMA, taw nwarrik ennjoum fil gayla!",
+  text: "Hey Jrouma, challenge me to an MMA round, and I will show you stars at noon!",
   tone: "shout",
 };
 
