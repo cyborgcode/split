@@ -153,9 +153,23 @@ const QUOTA_NOTICE: Notice = {
   tone: "warn",
 };
 
-/* Easter egg: whenever someone says "Adel said that". Speech recognition
-   often spells the name "Adele", "Adell" or "a del". */
-const ADEL_SAID_THAT = /\b(?:adel+e?|a del+)\s+said\s+that\b/gi;
+/* Easter egg: whenever someone says "Adel said that". English speech
+   recognition rarely knows the name, so accept how it tends to hear it
+   ("Adele", "a dell", "a deal", "Odell", "Adil", "Abdel", …) and how it
+   hears "said that" ("set that", "sad that", "says", or just "said"). */
+const ADEL_NAME =
+  "(?:a+d+e+l+e?|adil|adeel|adul|abdel+|odel+|oh\\s+del+|a\\s+del+|a\\s+deal|a\\s+dill?|ah\\s+del+|idle)";
+const ADEL_SAID = "(?:said|sed|set|sad|says|say)(?:\\s+(?:that|dat|this))?";
+const ADEL_SAID_THAT = new RegExp(`\\b${ADEL_NAME}\\s+${ADEL_SAID}\\b`, "g");
+
+/** Phrases the recognizer is nudged toward, where the browser allows it. */
+const SPEECH_HINTS = ["Adel said that", "Adel"];
+
+/** How many times the phrase occurs, ignoring case and punctuation. */
+function countAdelSaidThat(text: string): number {
+  const plain = text.toLowerCase().replace(/[^a-z\s]+/g, " ");
+  return plain.match(ADEL_SAID_THAT)?.length ?? 0;
+}
 const ADEL_NOTICE: Notice = {
   type: "notice",
   tag: "Challenge issued",
@@ -189,7 +203,7 @@ export default function Home() {
   }, []);
 
   const { supported, listening, transcript, interim, error, start, stop, reset } =
-    useSpeech("en-US", echoFilter);
+    useSpeech("en-US", echoFilter, SPEECH_HINTS);
 
   const [sessionActive, setSessionActive] = useState(false);
   const [findings, setFindings] = useState<PlacedFinding[]>([]);
@@ -756,7 +770,7 @@ export default function Home() {
   // finalized speech, so it costs no Gemini quota.
   useEffect(() => {
     if (!sessionActive) return;
-    const said = transcript.match(ADEL_SAID_THAT)?.length ?? 0;
+    const said = countAdelSaidThat(transcript);
     if (said > adelAnsweredRef.current) announce(ADEL_NOTICE);
     adelAnsweredRef.current = said;
   }, [transcript, sessionActive, announce]);

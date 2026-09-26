@@ -59,7 +59,10 @@ export interface UseSpeechResult {
  */
 export function useSpeech(
   lang = "en-US",
-  transform?: (text: string) => string
+  transform?: (text: string) => string,
+  /** Words to bias recognition toward (names it wouldn't otherwise know).
+   *  Only used where the browser supports contextual phrases. Stable ref. */
+  hints?: string[]
 ): UseSpeechResult {
   const [supported, setSupported] = useState(true);
   const [listening, setListening] = useState(false);
@@ -96,6 +99,24 @@ export function useSpeech(
     rec.continuous = true;
     rec.interimResults = true;
     rec.lang = lang;
+    // Contextual biasing (newer Chrome): helps it hear names like "Adel".
+    type PhraseCtor = new (phrase: string, boost: number) => unknown;
+    const Phrase = (window as unknown as { SpeechRecognitionPhrase?: PhraseCtor })
+      .SpeechRecognitionPhrase;
+    const setPhrases = (list: unknown[]) => {
+      try {
+        (rec as unknown as { phrases: unknown[] }).phrases = list;
+      } catch {
+        /* not supported here */
+      }
+    };
+    if (hints?.length && Phrase && "phrases" in rec) {
+      try {
+        setPhrases(hints.map((h) => new Phrase(h, 5)));
+      } catch {
+        /* not supported here */
+      }
+    }
 
     /* Finals are committed once per result index, so the transcript is
        append-only (findings anchor to character offsets in it). Re-reading
@@ -165,6 +186,10 @@ export function useSpeech(
         shouldListenRef.current = false;
         setListening(false);
         setError("Microphone access denied. Allow the mic and try again.");
+      } else if (event.error === "phrases-not-supported") {
+        // This recognizer can't take hints — drop them and keep listening
+        // (the session ends; onend restarts it without the hints).
+        setPhrases([]);
       } else if (event.error !== "no-speech" && event.error !== "aborted") {
         setError(`Speech recognition error: ${event.error}`);
       }
@@ -224,7 +249,7 @@ export function useSpeech(
         /* already stopped */
       }
     };
-  }, [lang, transform]);
+  }, [lang, transform, hints]);
 
   const start = useCallback(() => {
     const rec = recognitionRef.current;
