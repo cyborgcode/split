@@ -53,6 +53,16 @@ function buildUserPrompt(chunk: string, context?: string): string {
   return `${ctx}NEW words just spoken — judge these:\n"""${chunk.trim()}"""`;
 }
 
+/* Audio requests (browsers without speech recognition, e.g. Firefox):
+   Gemini transcribes and fact-checks in one call, so listening costs no
+   extra quota. */
+const AUDIO_PROMPT =
+  "The NEW words are in the attached audio clip(s), in order. First write down exactly what is said in them in \"transcript\" — plain words, no speaker labels, no descriptions of sounds; use an empty string if there is no intelligible speech, and never invent words. Then judge the transcript as the NEW words.";
+
+type AudioPart = { data: string; mimeType: string };
+
+const AUDIO_MIME = /^audio\/(ogg|webm|mp4|mpeg|mp3|wav|aac|flac|x-m4a)$/;
+
 const GEMINI_RESPONSE_SCHEMA = {
   type: "OBJECT",
   propertyOrdering: ["claims", "fallacies"],
@@ -99,6 +109,13 @@ const GEMINI_RESPONSE_SCHEMA = {
   required: ["claims", "fallacies"],
 };
 
+const GEMINI_AUDIO_SCHEMA = {
+  ...GEMINI_RESPONSE_SCHEMA,
+  propertyOrdering: ["transcript", "claims", "fallacies"],
+  properties: { transcript: { type: "STRING" }, ...GEMINI_RESPONSE_SCHEMA.properties },
+  required: ["transcript", "claims", "fallacies"],
+};
+
 /* Free-tier quotas are counted per model, so falling through on a 429 to
    the next model roughly doubles how long a debate can run each day.
    Measured free tier (Sept 2026): both Flash-Lite models get 15 RPM /
@@ -123,7 +140,17 @@ function isDailyQuota(body: string): boolean {
   return /PerDay/i.test(body);
 }
 
-async function callGemini(chunk: string, context?: string): Promise<ModelReply> {
+async function callGemini(
+  chunk: string,
+  context?: string,
+  audio?: AudioPart[]
+): Promise<ModelReply> {
+  const userParts = audio?.length
+    ? [
+        ...audio.map((a) => ({ inlineData: { mimeType: a.mimeType, data: a.data } })),
+        { text: `${buildUserPrompt("(see the attached audio)", context)}\n\n${AUDIO_PROMPT}` },
+      ]
+    : [{ text: buildUserPrompt(chunk, context) }];
   const key = process.env.GEMINI_API_KEY!;
   const override = process.env.GEMINI_MODEL?.trim();
   const models = override
@@ -150,14 +177,14 @@ async function callGemini(chunk: string, context?: string): Promise<ModelReply> 
           body: JSON.stringify({
             systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
             contents: [
-              { role: "user", parts: [{ text: buildUserPrompt(chunk, context) }] },
+              { role: "user", parts: userParts },
             ],
             // Gemini 3 models are tuned for the default temperature (1.0);
             // forcing it low can make them loop or degrade — the schema
             // already keeps the output deterministic in shape.
             generationConfig: {
               responseMimeType: "application/json",
-              responseSchema: GEMINI_RESPONSE_SCHEMA,
+              responseSchema: audio?.length ? GEMINI_AUDIO_SCHEMA : GEMINI_RESPONSE_SCHEMA,
             },
           }),
           signal: AbortSignal.timeout(Math.min(15000, budget)),
@@ -205,6 +232,7 @@ async function callGemini(chunk: string, context?: string): Promise<ModelReply> 
 }
 
 interface ParsedReply {
+  transcript?: unknown;
   claims?: unknown;
   fallacies?: unknown;
 }
@@ -278,14 +306,15 @@ function toFindings(parsed: ParsedReply | null): {
   return { findings: findings.slice(0, 8), claimsChecked };
 }
 
-async function runAnalysis(chunk: string, context?: string) {
-  const reply = await callGemini(chunk, context);
+async function runAnalysis(chunk: string, context?: string, audio?: AudioPart[]) {
+  const reply = await callGemini(chunk, context, audio);
   const parsed = extractJson(reply.text);
   const { findings, claimsChecked } = toFindings(parsed);
+  const transcript = audio?.length ? str(parsed?.transcript) : undefined;
   console.log(
-    `analyze (${reply.model}): ${claimsChecked} claims, ${findings.length} findings`
+    `analyze (${reply.model}${audio?.length ? `, ${audio.length} audio clip(s)` : ""}): ${claimsChecked} claims, ${findings.length} findings`
   );
-  return { findings, claimsChecked, model: reply.model, parsed };
+  return { findings, claimsChecked, model: reply.model, parsed, transcript };
 }
 
 function missingKey(): NextResponse | null {
@@ -329,10 +358,23 @@ export async function POST(req: NextRequest) {
 
   const chunk = typeof body.chunk === "string" ? body.chunk.trim() : "";
   const context = typeof body.context === "string" ? body.context : undefined;
-  if (!chunk) {
-    return NextResponse.json({ error: "Missing 'chunk'" }, { status: 400 });
+  const audio = Array.isArray(body.audio)
+    ? body.audio
+        .filter(
+          (a): a is AudioPart =>
+            !!a && typeof a.data === "string" && typeof a.mimeType === "string"
+        )
+        .map((a) => ({ data: a.data, mimeType: a.mimeType.split(";")[0].trim() }))
+    : [];
+  if (!chunk && audio.length === 0) {
+    return NextResponse.json({ error: "Missing 'chunk' or 'audio'" }, { status: 400 });
   }
-  if (chunk.length > 4000 || (context?.length ?? 0) > 8000) {
+  if (audio.some((a) => !AUDIO_MIME.test(a.mimeType))) {
+    return NextResponse.json({ error: "Unsupported audio format" }, { status: 415 });
+  }
+  const audioBytes = audio.reduce((n, a) => n + a.data.length, 0);
+  // Vercel caps request bodies at 4.5 MB; the client keeps well under.
+  if (chunk.length > 4000 || (context?.length ?? 0) > 8000 || audioBytes > 3_500_000) {
     return NextResponse.json({ error: "Input too long" }, { status: 413 });
   }
 
@@ -340,11 +382,12 @@ export async function POST(req: NextRequest) {
   if (noKey) return noKey;
 
   try {
-    const result = await runAnalysis(chunk, context);
+    const result = await runAnalysis(chunk, context, audio);
     return NextResponse.json({
       findings: result.findings,
       claims_checked: result.claimsChecked,
       model: result.model,
+      ...(result.transcript !== undefined && { transcript: result.transcript }),
     });
   } catch (err) {
     return errorResponse(err);

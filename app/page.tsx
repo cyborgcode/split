@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSpeech } from "@/lib/useSpeech";
+import { useAudioCapture } from "@/lib/useAudioCapture";
 import WaveBar from "@/components/WaveBar";
 import {
   ClearIcon,
@@ -157,8 +158,20 @@ export default function Home() {
     return matches / words.length > 0.6 ? "" : text;
   }, []);
 
-  const { supported, listening, transcript, interim, error, start, stop, reset } =
-    useSpeech("en-US", echoFilter);
+  const speech = useSpeech("en-US", echoFilter);
+  /* Browsers without the Web Speech API (Firefox) record audio instead and
+     let Gemini transcribe it in the same request that fact-checks it. The
+     referee's own voice is discarded rather than filtered. */
+  const audio = useAudioCapture(() => speakingRef.current);
+  const audioMode = !speech.supported && audio.supported;
+  const audioModeRef = useRef(audioMode);
+  audioModeRef.current = audioMode;
+  const supported = speech.supported || audio.supported;
+  const listening = audioMode ? audio.listening : speech.listening;
+  const transcript = audioMode ? audio.transcript : speech.transcript;
+  const interim = audioMode ? "" : speech.interim;
+  const error = audioMode ? audio.error : speech.error;
+  const { takeClips, returnClips, hasClips, append: appendHeard } = audio;
 
   const [sessionActive, setSessionActive] = useState(false);
   const [findings, setFindings] = useState<PlacedFinding[]>([]);
@@ -519,6 +532,81 @@ export default function Home() {
 
   const cooldownUntilRef = useRef(0);
   const lastSentAtRef = useRef(0);
+
+  /** A failed /api/analyze call: back off, or explain what's wrong. */
+  const handleFailure = useCallback(
+    async (res: Response): Promise<"daily" | "transient" | "fatal"> => {
+      const data = await res.json().catch(() => null);
+      if (res.status === 429 && data?.daily_quota) {
+        // Every model's daily cap is spent — poll gently until it resets.
+        setQuotaExhausted(true);
+        // The banner is easy to miss with the phone lying between two
+        // debaters — say it out loud, once per outage.
+        if (!quotaAnnouncedRef.current) {
+          quotaAnnouncedRef.current = true;
+          announce(QUOTA_NOTICE);
+        }
+        cooldownUntilRef.current = Date.now() + 60000;
+        return "daily";
+      }
+      if (res.status === 429 || res.status === 503 || res.status === 504) {
+        // transient rate limit / overload / timeout — back off quietly
+        setRateLimited(true);
+        cooldownUntilRef.current = Date.now() + (res.status === 429 ? 15000 : 6000);
+        return "transient";
+      }
+      setApiError(data?.error ?? `Analysis failed (HTTP ${res.status})`);
+      return "fatal";
+    },
+    [announce]
+  );
+
+  /** A successful check: weave in new findings and call them out. */
+  const handleSuccess = useCallback(
+    (data: AnalyzeResponse, text: string, sentFrom: number) => {
+      setApiError(null);
+      setRateLimited(false);
+      setQuotaExhausted(false);
+      quotaAnnouncedRef.current = false;
+      if (data.model) setModel(data.model);
+      const now = Date.now();
+      const fresh = data.findings.filter((f) => {
+        const key = `${f.type}:${normalizeQuote(f.quote)}`;
+        const lastFlagged = seenQuotesRef.current.get(key);
+        if (lastFlagged && now - lastFlagged < REPEAT_WINDOW_MS) return false;
+        seenQuotesRef.current.set(key, now);
+        return true;
+      });
+      if (fresh.length > 0) {
+        const placed = fresh
+          .map((finding) => ({
+            id: nextIdRef.current++,
+            finding,
+            offset: anchorOffset(text, finding.quote, sentFrom),
+          }))
+          .sort((a, b) => a.offset - b.offset);
+        setFindings((prev) => {
+          // Cards render in order, so never anchor before an earlier card.
+          const floor = prev.length ? prev[prev.length - 1].offset : 0;
+          return [...prev, ...placed.map((p) => ({ ...p, offset: Math.max(p.offset, floor) }))];
+        });
+        // Speak first; live sources swap in whenever the search lands.
+        for (const p of placed) {
+          if (p.finding.type === "fact_check") enrichSource(p.id, p.finding);
+        }
+        interrupt(fresh);
+      } else if (data.findings.length > 0) {
+        // Flagged, but identical to a recent callout — don't claim "accurate".
+        flash("Repeated claim — already called out");
+      } else if ((data.claims_checked ?? 0) > 0) {
+        // Prove the referee is working even when nobody is wrong.
+        const n = data.claims_checked!;
+        flash(`${n} claim${n === 1 ? "" : "s"} checked — all accurate`);
+      }
+    },
+    [interrupt, enrichSource, flash]
+  );
+
   const analyze = useCallback(async (force = false) => {
     if (inFlightRef.current) return;
     const now = Date.now();
@@ -581,72 +669,13 @@ export default function Home() {
       if (epoch !== epochRef.current) return; // cleared while in flight
       if (!res.ok) {
         lastChunkRef.current = ""; // failed — let the next tick retry this chunk
-        const data = await res.json().catch(() => null);
-        if (res.status === 429 && data?.daily_quota) {
-          // Every model's daily cap is spent — poll gently until it resets.
-          setQuotaExhausted(true);
-          // The banner is easy to miss with the phone lying between two
-          // debaters — say it out loud, once per outage.
-          if (!quotaAnnouncedRef.current) {
-            quotaAnnouncedRef.current = true;
-            announce(QUOTA_NOTICE);
-          }
-          cooldownUntilRef.current = Date.now() + 60000;
-          return;
-        }
-        if (res.status === 429 || res.status === 503 || res.status === 504) {
-          // transient rate limit / overload / timeout — back off quietly
-          setRateLimited(true);
-          cooldownUntilRef.current = Date.now() + (res.status === 429 ? 15000 : 6000);
-          return;
-        }
-        setApiError(data?.error ?? `Analysis failed (HTTP ${res.status})`);
+        await handleFailure(res);
         return;
       }
-      setApiError(null);
-      setRateLimited(false);
-      setQuotaExhausted(false);
-      quotaAnnouncedRef.current = false;
       analyzedRef.current = sentUpTo;
       pendingSinceRef.current = null;
-
       const data: AnalyzeResponse = await res.json();
-      if (data.model) setModel(data.model);
-      const now = Date.now();
-      const fresh = data.findings.filter((f) => {
-        const key = `${f.type}:${normalizeQuote(f.quote)}`;
-        const lastFlagged = seenQuotesRef.current.get(key);
-        if (lastFlagged && now - lastFlagged < REPEAT_WINDOW_MS) return false;
-        seenQuotesRef.current.set(key, now);
-        return true;
-      });
-      if (fresh.length > 0) {
-        const text = transcriptRef.current;
-        const placed = fresh
-          .map((finding) => ({
-            id: nextIdRef.current++,
-            finding,
-            offset: anchorOffset(text, finding.quote, sentFrom),
-          }))
-          .sort((a, b) => a.offset - b.offset);
-        setFindings((prev) => {
-          // Cards render in order, so never anchor before an earlier card.
-          const floor = prev.length ? prev[prev.length - 1].offset : 0;
-          return [...prev, ...placed.map((p) => ({ ...p, offset: Math.max(p.offset, floor) }))];
-        });
-        // Speak first; live sources swap in whenever the search lands.
-        for (const p of placed) {
-          if (p.finding.type === "fact_check") enrichSource(p.id, p.finding);
-        }
-        interrupt(fresh);
-      } else if (data.findings.length > 0) {
-        // Flagged, but identical to a recent callout — don't claim "accurate".
-        flash("Repeated claim — already called out");
-      } else if ((data.claims_checked ?? 0) > 0) {
-        // Prove the referee is working even when nobody is wrong.
-        const n = data.claims_checked!;
-        flash(`${n} claim${n === 1 ? "" : "s"} checked — all accurate`);
-      }
+      handleSuccess(data, transcriptRef.current, sentFrom);
     } catch {
       if (epoch !== epochRef.current) return;
       lastChunkRef.current = ""; // failed — let the next tick retry this chunk
@@ -657,20 +686,81 @@ export default function Home() {
         setAnalyzing(false);
       }
     }
-  }, [interrupt, enrichSource, flash, announce]);
+  }, [handleFailure, handleSuccess]);
+
+  /** Audio mode: send every clip recorded since the last check. Clips are
+   *  already cut at pauses, and whatever piled up during a rate-limit pause
+   *  goes out together — one request, nothing lost. */
+  const sendAudio = useCallback(async (force = false) => {
+    if (inFlightRef.current || !hasClips()) return;
+    const now = Date.now();
+    if (now < cooldownUntilRef.current) return;
+    if (!force && now - lastSentAtRef.current < MIN_SPACING_MS) return;
+
+    const clips = takeClips();
+    inFlightRef.current = true;
+    lastSentAtRef.current = now;
+    const epoch = epochRef.current;
+    setAnalyzing(true);
+    try {
+      const text = transcriptRef.current;
+      let ctxStart = Math.max(0, text.length - CONTEXT_CHARS);
+      if (ctxStart > 0) ctxStart = text.indexOf(" ", ctxStart) + 1; // whole words
+      const context = text.slice(ctxStart).trim();
+      const res = simulateQuota()
+        ? new Response(JSON.stringify({ error: "Simulated daily quota", daily_quota: true }), {
+            status: 429,
+          })
+        : await fetch("/api/analyze", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chunk: "",
+              context,
+              audio: clips.map(({ data, mimeType }) => ({ data, mimeType })),
+            }),
+            signal: AbortSignal.timeout(28000),
+          });
+      if (epoch !== epochRef.current) return; // cleared while in flight
+      if (!res.ok) {
+        // Retry after a hiccup; audio from a quota outage can't be checked
+        // anyway, and a rejected clip would only fail again.
+        if ((await handleFailure(res)) === "transient") returnClips(clips);
+        return;
+      }
+      const data: AnalyzeResponse = await res.json();
+      const sentFrom = transcriptRef.current.length;
+      const heard = appendHeard(data.transcript ?? "", !!clips[0]?.pause);
+      transcriptRef.current = heard;
+      analyzedRef.current = heard.length;
+      handleSuccess(data, heard, sentFrom);
+    } catch {
+      if (epoch !== epochRef.current) return;
+      returnClips(clips);
+      setApiError("Network error while analyzing. Retrying…");
+    } finally {
+      if (epoch === epochRef.current) {
+        inFlightRef.current = false;
+        setAnalyzing(false);
+      }
+    }
+  }, [takeClips, returnClips, hasClips, appendHeard, handleFailure, handleSuccess]);
 
   // Pacing loop — cheap local checks; a request only goes out when the
   // speaker reaches a pause (or talks nonstop) and the spacing allows.
   useEffect(() => {
     if (!sessionActive) return;
-    const timer = setInterval(() => void analyze(), TICK_MS);
+    const timer = setInterval(
+      () => void (audioModeRef.current ? sendAudio() : analyze()),
+      TICK_MS
+    );
     return () => clearInterval(timer);
-  }, [sessionActive, analyze]);
+  }, [sessionActive, analyze, sendAudio]);
 
   // Primary trigger: check the moment new speech is finalized instead of
   // waiting for the next tick (analyze() itself enforces request spacing).
   useEffect(() => {
-    if (!sessionActive || !transcript) return;
+    if (!sessionActive || !transcript || audioModeRef.current) return;
     void analyze();
   }, [transcript, sessionActive, analyze]);
 
@@ -688,8 +778,9 @@ export default function Home() {
       unlock.volume = 0;
       window.speechSynthesis.speak(unlock);
     }
-    start();
-  }, [start, getAudioCtx]);
+    if (audioModeRef.current) void audio.start();
+    else speech.start();
+  }, [speech, audio, getAudioCtx]);
 
   const flushTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const handleStop = useCallback(() => {
@@ -702,24 +793,27 @@ export default function Home() {
     } catch {
       /* already stopped */
     }
-    stop();
+    const inAudioMode = audioModeRef.current;
+    if (inAudioMode) audio.stop();
+    else speech.stop();
     // The last words finalize a beat after stop(), and a request may still
     // be in flight — try the final short chunk a few times so it isn't lost.
     flushTimersRef.current.forEach(clearTimeout);
     flushTimersRef.current = [0, 1200, 3000, 6000].map((ms) =>
       setTimeout(() => {
         pendingSinceRef.current = 0;
-        void analyze(true);
+        void (inAudioMode ? sendAudio(true) : analyze(true));
       }, ms)
     );
-  }, [stop, analyze]);
+  }, [speech, audio, analyze, sendAudio]);
 
   const handleReset = useCallback(() => {
     flushTimersRef.current.forEach(clearTimeout);
     epochRef.current++;
     inFlightRef.current = false;
     setAnalyzing(false);
-    reset();
+    speech.reset();
+    audio.reset();
     setFindings([]);
     setApiError(null);
     setNote(null);
@@ -727,7 +821,7 @@ export default function Home() {
     lastChunkRef.current = "";
     pendingSinceRef.current = null;
     seenQuotesRef.current.clear();
-  }, [reset]);
+  }, [speech, audio]);
 
   // Keep the newest words in view — unless the reader scrolled up.
   const stickToBottomRef = useRef(true);
@@ -811,7 +905,11 @@ export default function Home() {
               ? { text: "Paused", tone: "idle" }
               : note
                 ? { text: note, tone: "ok" }
-                : { text: "Listening", tone: "live" };
+                : {
+                    // Audio mode shows words only once Gemini transcribes them.
+                    text: audioMode ? "Listening — words appear after each pause" : "Listening",
+                    tone: "live",
+                  };
 
   const overlayFinding = speakingFinding ?? viewedFinding;
 
@@ -857,8 +955,8 @@ export default function Home() {
       )}
       {!supported && (
         <div className="banner warn">
-          This browser doesn&apos;t support live speech recognition. Use Chrome,
-          Edge, or Safari.
+          This browser can&apos;t record audio. Use Chrome, Edge, Safari, or
+          Firefox.
         </div>
       )}
       {quotaExhausted && (
@@ -914,7 +1012,7 @@ export default function Home() {
       </div>
 
       <div className="dock">
-        <WaveBar active={sessionActive} talking={!!interim} />
+        <WaveBar active={sessionActive} talking={audioMode ? audio.talking : !!interim} />
         <div className="controls">
           <div className="controls-side left">
             <button
