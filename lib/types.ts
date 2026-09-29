@@ -1,4 +1,4 @@
-export type Verdict = "false" | "misleading" | "unverifiable";
+export type Verdict = "false" | "misleading" | "unverifiable" | "disputed";
 
 export interface FactCheckFinding {
   type: "fact_check";

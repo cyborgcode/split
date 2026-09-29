@@ -299,6 +299,13 @@ a {
   color: var(--misleading);
   background: var(--misleading-bg);
 }
+.v-disputed {
+  border-color: var(--unverifiable) !important;
+}
+.v-disputed .tag {
+  color: var(--unverifiable);
+  background: var(--unverifiable-bg);
+}
 .v-unverifiable {
   border-color: var(--unverifiable) !important;
 }

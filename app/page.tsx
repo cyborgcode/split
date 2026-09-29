@@ -62,6 +62,7 @@ const VERDICT_LABEL: Record<string, string> = {
   false: "False",
   misleading: "Misleading",
   unverifiable: "Unverifiable",
+  disputed: "Disputed",
 };
 
 /* Filler words say nothing about whether a phrase came from the referee. */
@@ -103,7 +104,9 @@ function ttsText(f: Finding): string {
       ? "Stop right there — that's false! Here's the truth:"
       : f.verdict === "misleading"
         ? "Hold on — that's misleading. Actually:"
-        : "Careful — that claim can't be verified.";
+        : f.verdict === "disputed"
+          ? "Hold on — that one is disputed."
+          : "Careful — that claim can't be verified.";
   const source = f.source_name ? ` Source: ${f.source_name}.` : "";
   return `${lead} ${f.correction}${source}`;
 }
@@ -483,7 +486,9 @@ export default function Home() {
       // than a few callouts. The rest get a soft chime; notices always do.
       // The voice cuts in over the alert's tail instead of waiting for it.
       let bigAlert = false;
-      if (!isNotice) {
+      // A disputed claim isn't anyone being wrong — no "faaah" for it.
+      const calledOut = !isNotice && !(next.type === "fact_check" && next.verdict === "disputed");
+      if (calledOut) {
         const since = calloutsSinceBigAlertRef.current;
         bigAlert = since > 0 && (since >= BIG_ALERT_MAX_GAP || Math.random() < BIG_ALERT_CHANCE);
         calloutsSinceBigAlertRef.current = bigAlert ? 0 : since + 1;

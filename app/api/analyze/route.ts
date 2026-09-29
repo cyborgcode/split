@@ -18,8 +18,9 @@ CLAIMS — extract EVERY concrete, checkable factual claim that is made or compl
 - "false": contradicts well-established knowledge, or a statistic far from the accepted figure. Popular myths are always false no matter how many people repeat them: the Great Wall visible from space or the Moon, humans use 10% of their brains, goldfish 3-second memory, Einstein failed math, Napoleon unusually short, sugar makes children hyperactive, lightning never strikes twice, most body heat lost through the head, bulls enraged by the color red, the sun orbits the Earth — and anything of that genre.
 - "misleading": technically true but framed to deceive.
 - "unverifiable": a specific suspicious statistic that cannot be confirmed.
+- "disputed": credible experts or scholars genuinely disagree — contested history, religious or scriptural history, or unsettled science — so neither "true" nor "false" is honest. Use it only when the disagreement exists among serious scholars or sources, never merely because laypeople, partisans, or fringe groups contest something (myths and debunked claims stay "false"). Never take a side on religious, theological, or moral questions.
 Do NOT list opinions, predictions, value judgments, personal anecdotes, or obvious hyperbole as claims.
-For every claim whose verdict is NOT "true", also provide: "correction" — the correct fact in one or two sentences; "source_name" and "source_url" — a real, well-known authoritative organization (WHO, BLS, NASA, FBI, Britannica, ...) and its canonical URL, never invented; "search_query" — 3-8 words to verify the correction via web search.
+For every claim whose verdict is NOT "true", also provide: "correction" — the correct fact in one or two sentences (for "disputed": state the main positions evenly, in one or two sentences, without endorsing any); "source_name" and "source_url" — a real, well-known authoritative organization (WHO, BLS, NASA, FBI, Britannica, ...) and its canonical URL, never invented; "search_query" — 3-8 words to verify the correction via web search.
 "quote" is a short verbatim excerpt of the claim as spoken — include the words from the conversation so far when the claim starts there. Do not re-judge claims that were fully made before the NEW words; if the NEW words repeat a false claim, flag it again.
 
 FALLACIES — committed in the NEW words, judged in the light of the whole exchange. Only clear-cut cases: ad hominem, straw man, false dilemma, slippery slope, whataboutism, appeal to fear, hasty generalization, red herring, circular reasoning, appeal to authority, tu quoque. Passionate disagreement is not a fallacy. Each entry: "fallacy_name", "quote" (verbatim), "explanation" (one short sentence).
@@ -31,6 +32,12 @@ NEW words: "crime is at an all-time high right now and you know it"
 
 NEW words: "water boils at 100 degrees celsius at sea level"
 {"claims": [{"quote": "water boils at 100 degrees celsius at sea level", "verdict": "true"}], "fallacies": []}
+
+NEW words: "the pyramids at giza were built around 2500 bc"
+{"claims": [{"quote": "the pyramids at giza were built around 2500 bc", "verdict": "true"}], "fallacies": []}
+
+NEW words: "you can't follow him because he married her when she was nine"
+{"claims": [{"quote": "he married her when she was nine", "verdict": "disputed", "correction": "Classical hadith collections report Aisha was nine when the marriage began; some historians and scholars argue from other sources that she was older. Scholars disagree.", "source_name": "Encyclopaedia Britannica", "source_url": "https://www.britannica.com", "search_query": "Aisha age at marriage scholarly debate"}], "fallacies": []}
 
 NEW words: "well I just think raising taxes is a terrible idea and it always backfires"
 {"claims": [], "fallacies": []}
@@ -73,7 +80,7 @@ const GEMINI_RESPONSE_SCHEMA = {
           quote: { type: "STRING" },
           verdict: {
             type: "STRING",
-            enum: ["true", "false", "misleading", "unverifiable"],
+            enum: ["true", "false", "misleading", "unverifiable", "disputed"],
           },
           correction: { type: "STRING" },
           source_name: { type: "STRING" },
@@ -243,7 +250,7 @@ function toFindings(parsed: ParsedReply | null): {
       const verdict = str(c.verdict).toLowerCase();
       if (!quote || !verdict) continue;
       claimsChecked++;
-      if (verdict !== "false" && verdict !== "misleading" && verdict !== "unverifiable") {
+      if (!["false", "misleading", "unverifiable", "disputed"].includes(verdict)) {
         continue; // "true" (or anything unrecognized) is not an alert
       }
       findings.push({
